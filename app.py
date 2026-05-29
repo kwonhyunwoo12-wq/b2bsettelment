@@ -587,33 +587,96 @@ def parse_order_qty_from_product_name(name):
     return 1
 
 
+def parse_component_qtys_from_product_name(name):
+    """주문상품명 안에 포함된 세트 구성 수량을 추출합니다.
+
+    예) 모닝5개+코튼5개 세트 -> [5, 5]
+        본품(30정) X 2개 + 실속팩(100정) X 1개 -> [2, 1]
+        세정티슈 * 10개 -> [10]
+
+    이 수량은 '정산 수량'이 아니라 '세트 1개 안에 들어있는 구성품 수량'입니다.
+    따라서 RAW 출고량 5/5와 상품명 모닝5개+코튼5개가 만나면 정산 수량은 5가 아니라 1입니다.
+    """
+    s = normalize_text(name).replace("＊", "*").replace("×", "x").lower()
+    # [2개]처럼 대괄호로 들어간 주문 수량 표기는 구성 수량에서 제외
+    bracket_spans = [m.span() for m in re.finditer(r"\[\s*\d+\s*개\s*\]", s)]
+
+    def overlapped(span, spans):
+        return any(not (span[1] <= b[0] or span[0] >= b[1]) for b in spans)
+
+    found = []
+    spans = []
+
+    # X 2개, * 10개, x1ea 형태
+    for m in re.finditer(r"(?:x|\*)\s*(\d+)\s*(?:개|ea|입)?", s):
+        if overlapped(m.span(), bracket_spans):
+            continue
+        q = int(m.group(1))
+        if q > 0:
+            found.append(q)
+            spans.append(m.span())
+
+    # 모닝5개, 코튼 5개, 10개 세트 형태
+    for m in re.finditer(r"(?<!\d)(\d+)\s*개", s):
+        if overlapped(m.span(), bracket_spans) or overlapped(m.span(), spans):
+            continue
+        q = int(m.group(1))
+        if q > 0:
+            found.append(q)
+            spans.append(m.span())
+
+    return found
+
+
 def infer_output_qty_for_group(group):
     """RAW 그룹 1건의 정산 수량을 계산합니다.
 
-    물류 RAW는 하나의 주문상품이 자사상품명 기준으로 여러 줄 분해될 수 있습니다.
-    예) 세탁 2종 선물세트 28개 출고 → 단상자 28 / 모닝머스크 28 / 코튼가든 28
-    이때 정산 수량은 1이 아니라 28이어야 하므로, 여러 구성품 출고량의 최대공약수(GCD)를
-    주문상품 수량으로 추정합니다.
-
-    - 상품명에 `[n개]`가 있으면 n
-    - 단품이고 RAW가 1줄이면 출고량
-    - RAW가 여러 줄이면 출고량들의 최대공약수
-      · 본품 2 + 실속팩 1 → GCD(2,1)=1
-      · 선물세트 28개 → GCD(28,28,28)=28
-      · 3종세트 28개(본품28/리필56/박스28) → GCD(28,56,28)=28
+    핵심 원칙:
+    - 주문상품명에 구성품 수량이 들어간 세트명은 해당 수량을 '세트 구성'으로 보고,
+      RAW 출고량을 구성 수량으로 나눈 값을 정산 수량으로 봅니다.
+      · 모닝5개+코튼5개 세트 / RAW 모닝5, 코튼5 -> 정산 수량 1
+      · 모닝5개+코튼5개 세트 / RAW 모닝10, 코튼10 -> 정산 수량 2
+    - 구성 수량이 상품명에 없으면 여러 구성품 출고량의 최대공약수(GCD)를 사용합니다.
+      · 선물세트 28개 출고 → 단상자28/모닝28/코튼28 -> 정산 수량 28
+    - 단품 1줄이고 구성 수량도 없으면 원본 출고량을 정산 수량으로 사용합니다.
+      · 포밍 주방세제 본품 출고량 2 -> 정산 수량 2
     """
     import math
 
     order_name = normalize_text(group["주문 상품명"].iloc[0])
-    bracket_qty = parse_order_qty_from_product_name(order_name)
-    if bracket_qty > 1:
-        return bracket_qty
 
     if "출고량" in group.columns:
         qtys = [clean_qty(x) for x in group["출고량"].tolist()]
         qtys = [int(q) for q in qtys if q and q > 0]
     else:
         qtys = []
+
+    component_qtys = parse_component_qtys_from_product_name(order_name)
+    if qtys and component_qtys:
+        # RAW 라인 수와 상품명 구성수량 개수가 맞으면 라인별 비율로 정산 수량을 추정
+        if len(qtys) == len(component_qtys) and all(c > 0 for c in component_qtys):
+            ratios = []
+            ok = True
+            for q, c in zip(qtys, component_qtys):
+                if q % c != 0:
+                    ok = False
+                    break
+                ratios.append(q // c)
+            if ok and ratios:
+                qty = ratios[0]
+                for r in ratios[1:]:
+                    qty = math.gcd(qty, r)
+                return max(qty, 1)
+
+        # 단일 라인 세트/묶음: 세정티슈 * 10개 / RAW 출고량 10 -> 정산 수량 1
+        if len(qtys) == 1 and len(component_qtys) == 1 and component_qtys[0] > 0:
+            q, c = qtys[0], component_qtys[0]
+            if q % c == 0:
+                return max(q // c, 1)
+
+    bracket_qty = parse_order_qty_from_product_name(order_name)
+    if bracket_qty > 1:
+        return bracket_qty
 
     if len(group) == 1:
         return max(qtys[0], 1) if qtys else 1
@@ -763,7 +826,11 @@ def calculate_settlement(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partne
     if "RAW병합라인수" in df.columns and "원본출고량" in df.columns:
         raw_one_line = df["RAW병합라인수"].map(clean_qty).eq(1)
         raw_qty = df["원본출고량"].map(clean_qty)
-        df.loc[raw_one_line & raw_qty.gt(0), "수량"] = raw_qty[raw_one_line & raw_qty.gt(0)]
+        # 단일 RAW 라인이라도 주문상품명에 '*10개', '10개 세트' 같은 구성수량이 있으면
+        # 이미 normalize_raw_export_df에서 정산 수량을 원본출고량/구성수량으로 보정했습니다.
+        # 이 경우 다시 원본출고량으로 덮어쓰면 세트 1개가 10개로 표시되므로 제외합니다.
+        has_component_qty = df["주문 상품명"].map(lambda x: len(parse_component_qtys_from_product_name(x)) > 0)
+        df.loc[raw_one_line & raw_qty.gt(0) & (~has_component_qty), "수량"] = raw_qty[raw_one_line & raw_qty.gt(0) & (~has_component_qty)]
     df["주문일"] = pd.to_datetime(df["주문일"], errors="coerce").dt.strftime("%Y-%m-%d")
 
     match_df = build_product_matches(df["주문 상품명"].dropna().unique(), prod, threshold=match_threshold)
