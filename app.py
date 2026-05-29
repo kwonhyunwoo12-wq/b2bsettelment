@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz, process
 
-APP_TITLE = "터블/키친플래그 B2B 월정산 자동화"
+APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v9"
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "b2b_settlement.db")
 SEED_PRODUCT_PATH = os.path.join(BASE_DIR, "seed_data", "product_master.csv")
@@ -24,6 +24,7 @@ DEFAULT_PARTNER_MATCH_THRESHOLD = 75
 PRODUCT_COLS = ["source_product_name", "standard_product_name", "brand", "supply_price", "carton_qty", "shipping_fee", "memo"]
 PARTNER_COLS = ["partner", "display_partner", "email", "include_yn", "default_shipping_fee", "memo"]
 EXCEPTION_COLS = ["partner", "source_product_name", "exception_supply_price", "memo"]
+COST_COLS = ["source_product_name", "standard_product_name", "brand", "cost_price", "memo"]
 
 
 def normalize_text(v):
@@ -32,11 +33,22 @@ def normalize_text(v):
     return re.sub(r"\s+", " ", str(v).strip())
 
 
+def normalize_brand_aliases(s):
+    """브랜드 표기 차이를 동일하게 처리합니다.
+
+    예: TUBBLE = 터블, KITCHEN FLAG/KITCHENFLAG/키친 플래그 = 키친플래그
+    """
+    s = normalize_text(s).lower()
+    s = re.sub(r"t\s*u\s*b\s*b\s*l\s*e", "터블", s)
+    s = re.sub(r"kitchen\s*[-_]?\s*flag", "키친플래그", s)
+    s = re.sub(r"키친\s*[-_]?\s*플래그", "키친플래그", s)
+    return s
+
+
 def canonical_product_name(v):
     """상품명 유사도 비교용 정규화: 공백/기호/괄호/규격 표기 차이를 최대한 제거합니다."""
-    s = normalize_text(v).lower()
+    s = normalize_brand_aliases(v)
     s = s.replace("ｐ", "p").replace("－", "-").replace("–", "-").replace("—", "-")
-    s = s.replace("tubble", "터블").replace("kitchenflag", "키친플래그")
     s = re.sub(r"^\s*\d+\s*[.)-]\s*", " ", s)  # 38. 같은 관리번호 제거
     s = re.sub(r"\[[^\]]*\]", " ", s)  # [Tubble] 같은 태그 제거
     s = re.sub(r"(\d+)\s*정", r"\1p", s)
@@ -425,6 +437,17 @@ def init_db():
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cost_master (
+                source_product_name TEXT PRIMARY KEY,
+                standard_product_name TEXT,
+                brand TEXT,
+                cost_price INTEGER DEFAULT 0,
+                memo TEXT
+            )
+            """
+        )
         c.commit()
     seed_products_if_empty()
 
@@ -467,7 +490,14 @@ def replace_table(table, df, cols):
         clean["source_product_name"] = clean["source_product_name"].map(normalize_text)
         clean["exception_supply_price"] = clean["exception_supply_price"].map(clean_price)
         clean = clean[clean["partner"].ne("") & clean["source_product_name"].ne("")]
-    clean = clean.drop_duplicates(subset=[cols[0]] if table != "price_exception" else ["partner", "source_product_name"], keep="last")
+    elif table == "cost_master":
+        clean["source_product_name"] = clean["source_product_name"].map(normalize_text)
+        clean["standard_product_name"] = clean["standard_product_name"].map(normalize_text)
+        clean["brand"] = clean["brand"].map(normalize_text)
+        clean["cost_price"] = clean["cost_price"].map(clean_price)
+        clean["memo"] = clean["memo"].map(normalize_text)
+        clean = clean[clean["source_product_name"].ne("")]
+    clean = clean.drop_duplicates(subset=[cols[0]] if table not in ["price_exception"] else ["partner", "source_product_name"], keep="last")
     with conn() as c:
         clean.to_sql(table, c, if_exists="replace", index=False)
         c.commit()
@@ -520,7 +550,8 @@ def parse_product_master_excel(file) -> pd.DataFrame:
         ship_col = next((c for c in df.columns if "배송비" in str(c)), None)
         if not product_col or not price_col:
             continue
-        brand = "터블" if "터블" in sheet or "Tubble" in sheet else ("키친플래그" if "키친" in sheet or "Kitchen" in sheet else "")
+        sheet_alias = normalize_brand_aliases(sheet)
+        brand = "터블" if "터블" in sheet_alias else ("키친플래그" if "키친플래그" in sheet_alias else "")
         temp = pd.DataFrame()
         temp["source_product_name"] = df[product_col].map(normalize_text)
         temp["standard_product_name"] = temp["source_product_name"]
@@ -747,7 +778,12 @@ def calculate_settlement(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partne
     df["세트구성"] = ""
     for idx, r in df.iterrows():
         bundle = None
-        if "자사상품명_수량구성" in df.columns and clean_qty(r.get("RAW병합라인수", 0)) > 1:
+        # 실제 물류 RAW에는 주문상품명은 판매명, 자사상품명은 실제 출고 SKU로 들어옵니다.
+        # 따라서 단품 1줄이어도 주문상품명 매칭이 애매하거나 단가가 비어 있을 수 있으므로,
+        # 자사상품명_수량구성이 있으면 우선 이를 기준으로 공급가를 보정합니다.
+        # 예: 주문상품명 `[Tubble] 이지클린 텀블러 세정제 10P`
+        #     자사상품명 `40.터블 ... 스타터팩(8g x 10정)` → 스타터팩/10P 단가 적용
+        if "자사상품명_수량구성" in df.columns and normalize_text(r.get("자사상품명_수량구성", "")):
             bundle = calculate_internal_component_price(
                 r.get("자사상품명_수량구성", ""),
                 r.get("수량", 1),
@@ -818,6 +854,20 @@ def excel_bytes(df, sheet_name="거래내역서"):
             ws.write(0, i, col, header_fmt)
             fmt = money_fmt if col in ["수량", "공급가", "배송비", "상품금액", "총액"] else (date_fmt if col == "주문일" else text_fmt)
             ws.set_column(i, i, widths.get(col, 14), fmt)
+        # 거래처에 전달한 파일에서도 검산/수정이 가능하도록 계산 컬럼은 엑셀 수식으로 내보냄
+        # F=수량, G=공급가, H=배송비, I=상품금액, J=총액
+        qty_idx = OUTPUT_COLS.index("수량")
+        price_idx = OUTPUT_COLS.index("공급가")
+        ship_idx = OUTPUT_COLS.index("배송비")
+        item_amount_idx = OUTPUT_COLS.index("상품금액")
+        total_idx = OUTPUT_COLS.index("총액")
+        for r in range(len(df)):
+            excel_row = r + 2
+            cached_item_amount = int(df.iloc[r].get("상품금액", 0) or 0)
+            cached_total = int(df.iloc[r].get("총액", 0) or 0)
+            ws.write_formula(r + 1, item_amount_idx, f"=F{excel_row}*G{excel_row}", money_fmt, cached_item_amount)
+            ws.write_formula(r + 1, total_idx, f"=I{excel_row}+H{excel_row}", money_fmt, cached_total)
+
         ws.freeze_panes(1, 0)
         ws.autofilter(0, 0, max(len(df), 1), len(OUTPUT_COLS)-1)
         total_row = len(df) + 2
@@ -873,6 +923,7 @@ def settings_backup_bytes():
         read_table("product_master", PRODUCT_COLS).to_excel(writer, index=False, sheet_name="product_master")
         read_table("partner_master", PARTNER_COLS).to_excel(writer, index=False, sheet_name="partner_master")
         read_table("price_exception", EXCEPTION_COLS).to_excel(writer, index=False, sheet_name="price_exception")
+        read_table("cost_master", COST_COLS).to_excel(writer, index=False, sheet_name="cost_master")
     output.seek(0)
     return output.getvalue()
 
@@ -885,6 +936,8 @@ def restore_settings(file):
         replace_table("partner_master", pd.read_excel(file, sheet_name="partner_master"), PARTNER_COLS)
     if "price_exception" in xl.sheet_names:
         replace_table("price_exception", pd.read_excel(file, sheet_name="price_exception"), EXCEPTION_COLS)
+    if "cost_master" in xl.sheet_names:
+        replace_table("cost_master", pd.read_excel(file, sheet_name="cost_master"), COST_COLS)
 
 
 def page_products():
@@ -924,6 +977,216 @@ def page_exceptions():
         replace_table("price_exception", edited, EXCEPTION_COLS)
         st.success("저장 완료")
 
+
+
+
+def ensure_cost_master_from_products():
+    """상품마스터에 있는 상품을 원가마스터에도 기본 생성합니다. 원가는 매월 바뀌므로 0원으로 두고 사용자가 입력합니다."""
+    prod = read_table("product_master", PRODUCT_COLS)
+    cost = read_table("cost_master", COST_COLS)
+    existing = set(cost["source_product_name"].map(normalize_text).tolist()) if not cost.empty else set()
+    new_rows = []
+    for _, r in prod.iterrows():
+        src = normalize_text(r.get("source_product_name", ""))
+        if src and src not in existing:
+            new_rows.append({
+                "source_product_name": src,
+                "standard_product_name": normalize_text(r.get("standard_product_name", src)),
+                "brand": normalize_text(r.get("brand", "")),
+                "cost_price": 0,
+                "memo": "상품마스터에서 자동 생성",
+            })
+    if new_rows:
+        upsert_table("cost_master", pd.DataFrame(new_rows), COST_COLS, ["source_product_name"])
+
+
+def parse_cost_excel(file):
+    """원가표 엑셀을 유연하게 읽습니다. 상품명/원가 컬럼이 있으면 cost_master 형식으로 변환합니다."""
+    xl = pd.ExcelFile(file)
+    rows = []
+    for sheet in xl.sheet_names:
+        df = pd.read_excel(file, sheet_name=sheet)
+        df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
+        product_col = next((c for c in df.columns if c in ["source_product_name", "상품명", "자사 상품명", "자사상품명"] or "상품명" in str(c)), None)
+        cost_col = next((c for c in df.columns if c in ["cost_price", "원가"] or "원가" in str(c)), None)
+        brand_col = next((c for c in df.columns if c in ["brand", "브랜드"] or "브랜드" in str(c)), None)
+        std_col = next((c for c in df.columns if c in ["standard_product_name", "표준상품명"] or "표준" in str(c)), None)
+        if not product_col or not cost_col:
+            continue
+        temp = pd.DataFrame()
+        temp["source_product_name"] = df[product_col].map(normalize_text)
+        temp["standard_product_name"] = df[std_col].map(normalize_text) if std_col else temp["source_product_name"]
+        temp["brand"] = df[brand_col].map(normalize_text) if brand_col else ""
+        temp["cost_price"] = df[cost_col].map(clean_price)
+        temp["memo"] = f"원가표 업로드: {sheet}"
+        temp = temp[temp["source_product_name"].ne("")]
+        rows.append(temp[COST_COLS])
+    if not rows:
+        return pd.DataFrame(columns=COST_COLS)
+    return pd.concat(rows, ignore_index=True).drop_duplicates(subset=["source_product_name"], keep="last")
+
+
+def explode_cost_components(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partner_threshold=DEFAULT_PARTNER_MATCH_THRESHOLD):
+    """정산 RAW를 실제 출고 단품 기준으로 풀어서 거래처별 원가계산용 데이터로 만듭니다."""
+    prod = read_table("product_master", PRODUCT_COLS)
+    partners = read_table("partner_master", PARTNER_COLS)
+    cost = read_table("cost_master", COST_COLS)
+    prod_index = prepare_product_match_index(prod)
+    cost_index = prepare_product_match_index(cost.rename(columns={"cost_price": "supply_price"}) if not cost.empty else prod.iloc[0:0].copy()) if not cost.empty else prod_index
+    cost_map = {normalize_text(r["source_product_name"]): clean_price(r["cost_price"]) for _, r in cost.iterrows()}
+
+    df = raw_df.copy()
+    for col in ["파트너사", "주문 상품명", "수취인", "수취인 주소"]:
+        if col in df.columns:
+            df[col] = df[col].map(normalize_text)
+    df["주문일"] = pd.to_datetime(df["주문일"], errors="coerce").dt.strftime("%Y-%m-%d")
+    partner_match_df = build_partner_matches(df["파트너사"].dropna().unique(), partners, threshold=partner_threshold)
+    partner_map = {normalize_text(r["원본파트너사"]): normalize_text(r["정산거래처명"]) for _, r in partner_match_df.iterrows()}
+
+    rows = []
+    for _, r in df.iterrows():
+        raw_partner = normalize_text(r.get("파트너사", ""))
+        display_partner = partner_map.get(raw_partner, raw_partner)
+        comp_string = normalize_text(r.get("자사상품명_수량구성", ""))
+        if comp_string:
+            tokens = [x for x in comp_string.split(" || ") if normalize_text(x)]
+        else:
+            tokens = [f"{normalize_text(r.get('주문 상품명', ''))} × {max(clean_qty(r.get('수량', 1)), 1)}"]
+        for token in tokens:
+            m = re.match(r"(.+?)\s*×\s*(\d+(?:\.\d+)?)\s*$", token)
+            if m:
+                item_name = normalize_text(m.group(1))
+                qty = float(m.group(2))
+            else:
+                item_name = normalize_text(token)
+                qty = 1.0
+            # 원가마스터 우선 매칭, 실패 시 상품마스터명으로 보조 매칭
+            src, score, mtype = match_one_product_name(item_name, cost_index, threshold=match_threshold)
+            if not src:
+                src, score, mtype = match_one_product_name(item_name, prod_index, threshold=match_threshold)
+            unit_cost = cost_map.get(normalize_text(src), 0) if src else 0
+            amount = int(round(qty * unit_cost))
+            rows.append({
+                "원본 파트너사": raw_partner,
+                "정산거래처명": display_partner,
+                "주문일": normalize_text(r.get("주문일", "")),
+                "송장번호": normalize_text(r.get("송장번호", "")),
+                "주문 상품명": normalize_text(r.get("주문 상품명", "")),
+                "실제 출고상품명": item_name,
+                "매칭 원가상품명": src,
+                "매칭점수": int(round(score)) if score else 0,
+                "매칭방식": mtype,
+                "수량": qty,
+                "단품원가": int(unit_cost),
+                "원가금액": amount,
+                "오류": ("원가상품 미매칭; " if not src else "") + ("원가 누락/0원; " if src and unit_cost <= 0 else ""),
+            })
+    if not rows:
+        return pd.DataFrame(columns=["원본 파트너사", "정산거래처명", "실제 출고상품명", "수량", "단품원가", "원가금액", "오류"])
+    out = pd.DataFrame(rows)
+    # 수량은 엑셀/화면에서 보기 좋게 정수 가능하면 정수로 표시
+    out["수량"] = out["수량"].map(lambda x: int(x) if float(x).is_integer() else round(float(x), 2))
+    return out
+
+
+def cost_summary_excel_bytes(cost_df):
+    output = io.BytesIO()
+    partner_summary = cost_df.groupby("정산거래처명", as_index=False).agg(
+        출고단품수량=("수량", "sum"),
+        원가금액=("원가금액", "sum"),
+        오류건수=("오류", lambda s: int(s.fillna("").ne("").sum())),
+    ).sort_values("원가금액", ascending=False)
+    item_summary = cost_df.groupby(["정산거래처명", "매칭 원가상품명", "실제 출고상품명"], dropna=False, as_index=False).agg(
+        수량=("수량", "sum"),
+        단품원가=("단품원가", "max"),
+        원가금액=("원가금액", "sum"),
+    ).sort_values(["정산거래처명", "원가금액"], ascending=[True, False])
+    errors = cost_df[cost_df["오류"].fillna("").ne("")]
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        partner_summary.to_excel(writer, index=False, sheet_name="거래처별 원가요약")
+        item_summary.to_excel(writer, index=False, sheet_name="거래처_상품별 원가")
+        cost_df.to_excel(writer, index=False, sheet_name="전체 원가상세")
+        if not errors.empty:
+            errors.to_excel(writer, index=False, sheet_name="원가 오류확인")
+        workbook = writer.book
+        money_fmt = workbook.add_format({"num_format": "#,##0", "border": 1})
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#E7E6E6", "border": 1, "align": "center"})
+        for ws in writer.sheets.values():
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, 0, 20)
+            for col_idx in range(0, 20):
+                ws.set_column(col_idx, col_idx, 16)
+            ws.set_column(3, 6, 28)
+            ws.set_column(10, 12, 14, money_fmt)
+            # header format roughly
+            for col_idx in range(0, 20):
+                try:
+                    cell = ws.table if False else None
+                except Exception:
+                    pass
+    output.seek(0)
+    return output.getvalue()
+
+
+def page_cost_master():
+    st.subheader("월별 원가 관리")
+    st.caption("원가는 매월 바뀔 수 있으므로 정산월마다 이 화면에서 단품 원가를 입력/수정합니다. 원가정산은 배송비를 제외하고 실제 출고 단품 수량 × 단품원가로 계산합니다.")
+    ensure_cost_master_from_products()
+    upload = st.file_uploader("원가표 엑셀 업로드", type=["xlsx"], key="cost_upload")
+    if upload and st.button("원가표 불러오기/병합", type="primary"):
+        imported = parse_cost_excel(upload)
+        if imported.empty:
+            st.error("상품명/원가 컬럼을 찾지 못했습니다. 엑셀에 상품명, 원가 컬럼이 있는지 확인해 주세요.")
+        else:
+            upsert_table("cost_master", imported, COST_COLS, ["source_product_name"])
+            st.success(f"{len(imported):,}개 원가를 불러왔습니다.")
+    if st.button("상품마스터 기준으로 원가상품 목록 새로고침"):
+        ensure_cost_master_from_products()
+        st.success("상품마스터에 있는 신규 상품을 원가마스터에 추가했습니다.")
+    cost = read_table("cost_master", COST_COLS)
+    edited = st.data_editor(cost, num_rows="dynamic", use_container_width=True, key="cost_editor", height=560)
+    if st.button("원가마스터 저장"):
+        replace_table("cost_master", edited, COST_COLS)
+        st.success("저장 완료")
+
+
+def page_cost_settlement():
+    st.subheader("거래처별 원가정산")
+    st.markdown("정산 완료 후 ERP 원가 입력용으로 쓰는 기능입니다. RAW 출고리스트를 업로드하면 실제 출고된 단품 기준으로 거래처별 원가를 계산합니다. 배송비는 포함하지 않습니다.")
+    with st.expander("매칭 설정", expanded=True):
+        match_threshold = st.slider("원가상품 유사매칭 기준점수", min_value=70, max_value=100, value=DEFAULT_MATCH_THRESHOLD, step=1, key="cost_match_threshold")
+        partner_threshold = st.slider("파트너사 오타 자동묶음 기준점수", min_value=60, max_value=100, value=DEFAULT_PARTNER_MATCH_THRESHOLD, step=1, key="cost_partner_threshold")
+    raw_upload = st.file_uploader("RAW 출고리스트 엑셀 업로드", type=["xlsx"], key="cost_raw_upload")
+    if not raw_upload:
+        st.info("정산 때 사용한 것과 같은 RAW 출고리스트를 업로드하면 됩니다. 자사상품명 분해라인을 이용해 실제 출고 단품 기준 원가를 계산합니다.")
+        return
+    try:
+        raw = read_raw_excel(raw_upload)
+        ensure_partners(raw, partner_threshold=partner_threshold)
+        ensure_cost_master_from_products()
+        cost_df = explode_cost_components(raw, match_threshold=match_threshold, partner_threshold=partner_threshold)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("거래처", f"{cost_df['정산거래처명'].nunique():,}개")
+        c2.metric("출고 단품 라인", f"{len(cost_df):,}건")
+        c3.metric("총 출고수량", f"{float(cost_df['수량'].sum()):,.0f}개")
+        c4.metric("총 원가", f"{int(cost_df['원가금액'].sum()):,}원")
+        errors = cost_df[cost_df["오류"].fillna("").ne("")]
+        if not errors.empty:
+            st.error(f"원가 미매칭/누락 {len(errors):,}건이 있습니다. 원가 관리 메뉴에서 원가를 입력하거나 상품명을 확인하세요.")
+            st.dataframe(errors.head(500), use_container_width=True, height=260)
+        else:
+            st.success("원가 누락 없이 계산되었습니다.")
+        st.markdown("### 거래처별 원가요약")
+        partner_summary = cost_df.groupby("정산거래처명", as_index=False).agg(출고단품수량=("수량", "sum"), 원가금액=("원가금액", "sum")).sort_values("원가금액", ascending=False)
+        st.dataframe(partner_summary, use_container_width=True, height=260)
+        st.markdown("### 거래처/상품별 원가")
+        item_summary = cost_df.groupby(["정산거래처명", "매칭 원가상품명", "실제 출고상품명"], dropna=False, as_index=False).agg(수량=("수량", "sum"), 단품원가=("단품원가", "max"), 원가금액=("원가금액", "sum")).sort_values(["정산거래처명", "원가금액"], ascending=[True, False])
+        st.dataframe(item_summary, use_container_width=True, height=360)
+        st.markdown("### 전체 원가 상세")
+        st.dataframe(cost_df.head(1000), use_container_width=True, height=360)
+        st.download_button("원가정산 엑셀 다운로드", data=cost_summary_excel_bytes(cost_df), file_name=f"B2B_거래처별_원가정산_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    except Exception as e:
+        st.exception(e)
 
 def page_backup():
     st.subheader("설정 백업/복원")
@@ -993,9 +1256,13 @@ def app():
     init_db()
     st.title(APP_TITLE)
     st.caption("RAW 출고리스트 → 업체별 공급가/배송비 계산 → 거래처 제출용 거래내역서 엑셀 ZIP 생성")
-    page = st.sidebar.radio("메뉴", ["정산파일 생성", "상품/표준 공급가", "업체별 예외 공급가", "거래처 관리", "설정 백업/복원"])
+    page = st.sidebar.radio("메뉴", ["정산파일 생성", "원가정산", "월별 원가 관리", "상품/표준 공급가", "업체별 예외 공급가", "거래처 관리", "설정 백업/복원"])
     if page == "정산파일 생성":
         page_settlement()
+    elif page == "원가정산":
+        page_cost_settlement()
+    elif page == "월별 원가 관리":
+        page_cost_master()
     elif page == "상품/표준 공급가":
         page_products()
     elif page == "업체별 예외 공급가":
