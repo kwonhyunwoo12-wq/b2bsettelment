@@ -33,22 +33,30 @@ def normalize_text(v):
 
 
 def canonical_product_name(v):
-    """상품명 유사도 비교용 정규화: 공백/기호/괄호 차이를 최대한 제거합니다."""
+    """상품명 유사도 비교용 정규화: 공백/기호/괄호/규격 표기 차이를 최대한 제거합니다."""
     s = normalize_text(v).lower()
     s = s.replace("ｐ", "p").replace("－", "-").replace("–", "-").replace("—", "-")
+    s = s.replace("tubble", "터블").replace("kitchenflag", "키친플래그")
+    s = re.sub(r"^\s*\d+\s*[.)-]\s*", " ", s)  # 38. 같은 관리번호 제거
     s = re.sub(r"\[[^\]]*\]", " ", s)  # [Tubble] 같은 태그 제거
+    s = re.sub(r"(\d+)\s*정", r"\1p", s)
+    s = re.sub(r"\d+(?:\.\d+)?\s*g\s*[x×]\s*", " ", s)  # 8g x 30p → 30p
+    s = s.replace("발포", "")
+    s = s.replace("1box", "본품")
     s = re.sub(r'[(){}<>\[\]/_+,:;|·ㆍ\\\'"“”‘’]', " ", s)
     s = re.sub(r"\s+", "", s)
     return s
 
 
-
-
 def canonical_partner_name(v):
-    """거래처명 유사도 비교용 정규화: (특판) 같은 태그/공백/기호 차이를 제거합니다."""
+    """거래처명 유사도 비교용 정규화.
+
+    (특판)은 대부분 단순 구분 태그라 제거하지만, (공구)/(CS)처럼 의미가 다른 구분값은 보존하여
+    서로 다른 채널이 과도하게 묶이지 않도록 합니다.
+    """
     s = normalize_text(v).lower()
-    s = re.sub(r"\([^)]*\)", " ", s)  # (특판) 등 제거
-    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\(\s*특판\s*\)", " ", s)
+    s = re.sub(r"\[\s*특판\s*\]", " ", s)
     s = re.sub(r"[^0-9a-z가-힣]", "", s)
     return s
 
@@ -143,6 +151,211 @@ def build_product_matches(raw_products, prod_df, threshold=DEFAULT_MATCH_THRESHO
             "매칭방식": mtype,
         })
     return pd.DataFrame(rows)
+
+
+
+
+def extract_bundle_expression(name):
+    """세트 계산에 사용할 상품 구성 문자열을 추출합니다.
+
+    일부 RAW 상품명은 앞쪽 판매명과 뒤쪽 대괄호 구성명이 함께 들어갑니다.
+    예: `[터블] ... 세트 [본품(30정) X 1개 + 실속팩(100정) X 1개]`
+    이 경우 앞쪽 판매명보다 대괄호 안 구성명이 정산 단가 계산에 더 정확하므로 우선 사용합니다.
+    """
+    s = normalize_text(name).replace("＊", "*").replace("×", "x").replace("＋", "+").replace("&", "+")
+    brackets = re.findall(r"\[([^\]]+)\]", s)
+    for b in reversed(brackets):
+        if "+" in b or re.search(r"(?:\*|x|X)\s*\d+\s*개?", b):
+            return normalize_text(b)
+    # 판매명 안에서 슬래시가 세트 구분자로 쓰인 경우도 일부 있으므로 +처럼 처리
+    # 단, URL/규격에는 거의 사용하지 않는 업무 데이터 기준의 보조 처리입니다.
+    return s
+
+
+def has_bundle_or_multiplier(name):
+    """상품명에 세트/묶음/수량 배수 계산이 필요한 패턴이 있는지 판단합니다."""
+    s = extract_bundle_expression(name).lower().replace("＊", "*").replace("×", "x")
+    return bool(
+        re.search(r"[+/]", s)
+        or re.search(r"(?:\*|x)\s*\d+\s*개?", s)
+        or re.search(r"\d+\s*개\s*(?:세트|묶음|입|구성)?", s)
+    )
+
+
+def strip_qty_token(part):
+    """컴포넌트명에서 '*10개', '10개 세트' 같은 수량표현을 제거하고 배수를 반환합니다."""
+    s = normalize_text(part).replace("＊", "*").replace("×", "x")
+    s = re.sub(r"^\s*\d+[-–—]\d+\)\s*", " ", s)  # 2-2) 같은 옵션번호 제거
+    s = s.replace("[", " ").replace("]", " ").replace("/", " ")
+    qty = 1
+    m = re.search(r"(?:\*|x|X)\s*(\d+)\s*개?", s)
+    if m:
+        qty = int(m.group(1))
+        s = re.sub(r"(?:\*|x|X)\s*\d+\s*개?", " ", s)
+    else:
+        # 30P, 20매 같은 규격 숫자는 건드리지 않고, '10개', '2개 세트'처럼 '개'가 붙은 경우만 배수로 봅니다.
+        m = re.search(r"(\d+)\s*개\s*(?:세트|묶음|입|구성)?", s)
+        if m:
+            qty = int(m.group(1))
+            s = re.sub(r"\d+\s*개\s*(?:세트|묶음|입|구성)?", " ", s)
+    s = re.sub(r"\b(set|bundle)\b", " ", s, flags=re.I)
+    s = re.sub(r"세트|묶음|구성", " ", s)
+    return normalize_text(s), max(qty, 1)
+
+
+def common_bundle_prefix(first_part):
+    """'포밍 주방세제 본품+리필'에서 뒤쪽 '리필' 매칭을 위해 '포밍 주방세제'를 추정합니다."""
+    s, _ = strip_qty_token(first_part)
+    s = re.sub(r"본품|리필|단품|낱개|추가|옵션", " ", s)
+    return normalize_text(s)
+
+
+def prepare_product_match_index(prod_df):
+    prod_df = prod_df.copy()
+    prod_df["_canon"] = prod_df["source_product_name"].map(canonical_product_name)
+    exact = {normalize_text(x): normalize_text(x) for x in prod_df["source_product_name"].dropna()}
+    canon_to_source = {}
+    choices = []
+    choice_to_source = {}
+    for _, r in prod_df.iterrows():
+        src = normalize_text(r["source_product_name"])
+        can = r["_canon"]
+        if not src or not can:
+            continue
+        canon_to_source.setdefault(can, src)
+        choices.append(can)
+        choice_to_source.setdefault(can, src)
+    return exact, canon_to_source, choices, choice_to_source
+
+
+def match_one_product_name(name, prod_index, threshold=DEFAULT_MATCH_THRESHOLD):
+    """상품명 하나를 상품마스터 source_product_name에 매칭합니다."""
+    exact, canon_to_source, choices, choice_to_source = prod_index
+    raw_norm = normalize_text(name)
+    raw_can = canonical_product_name(raw_norm)
+    if not raw_norm:
+        return "", 0, "미매칭"
+    if raw_norm in exact:
+        return exact[raw_norm], 100, "정확일치"
+    if raw_can in canon_to_source:
+        return canon_to_source[raw_can], 100, "정규화일치"
+    if choices:
+        hit = process.extractOne(raw_can, choices, scorer=fuzz.WRatio)
+        if hit and hit[1] >= threshold:
+            return choice_to_source[hit[0]], int(round(hit[1])), "유사매칭"
+        if hit:
+            return "", int(round(hit[1])), "미매칭"
+    return "", 0, "미매칭"
+
+
+def component_price_for_partner(source_name, display_partner, raw_partner, prod_price_map, exc_price_map):
+    """컴포넌트별 단가: 업체별 예외단가 > 표준단가."""
+    src = normalize_text(source_name)
+    dp = normalize_text(display_partner)
+    rp = normalize_text(raw_partner)
+    if (dp, src) in exc_price_map and exc_price_map[(dp, src)] > 0:
+        return exc_price_map[(dp, src)], "예외단가"
+    if (rp, src) in exc_price_map and exc_price_map[(rp, src)] > 0:
+        return exc_price_map[(rp, src)], "예외단가"
+    return prod_price_map.get(src, 0), "표준단가"
+
+
+def calculate_bundle_price(raw_product_name, display_partner, raw_partner, prod_df, exc_df, threshold=DEFAULT_MATCH_THRESHOLD):
+    """세트/묶음 상품의 공급가를 단품 상품마스터 기준으로 자동 계산합니다.
+
+    예)
+    - 포밍 주방세제 본품+리필 = 본품 단가 + 리필 단가
+    - 세정티슈 * 10개 = 세정티슈 단가 × 10
+    """
+    raw_name = normalize_text(raw_product_name)
+    if not has_bundle_or_multiplier(raw_name):
+        return None
+
+    prod_index = prepare_product_match_index(prod_df)
+    prod_price_map = {normalize_text(r["source_product_name"]): clean_price(r["supply_price"]) for _, r in prod_df.iterrows()}
+    exc_price_map = {(normalize_text(r["partner"]), normalize_text(r["source_product_name"])): clean_price(r["exception_supply_price"]) for _, r in exc_df.iterrows()}
+
+    raw_std = extract_bundle_expression(raw_name).replace("＋", "+").replace("&", "+")
+    # 상품명에 '/'가 세트 구성 구분자로 쓰인 경우도 +처럼 처리합니다.
+    raw_std = re.sub(r"\s*/\s*", "+", raw_std)
+    parts = [normalize_text(x) for x in raw_std.split("+") if normalize_text(x)]
+    if not parts:
+        return None
+
+    prefix = common_bundle_prefix(parts[0]) if len(parts) >= 2 else ""
+    total = 0
+    details = []
+    min_score = 100
+    for i, part in enumerate(parts):
+        comp_name, qty = strip_qty_token(part)
+        candidates = [comp_name]
+        # '본품+리필'처럼 두 번째 조각이 짧으면 앞쪽 상품군명을 붙여서 한 번 더 매칭합니다.
+        if i > 0 and prefix and len(canonical_product_name(comp_name)) <= 8:
+            candidates.insert(0, normalize_text(prefix + " " + comp_name))
+        best = ("", 0, "미매칭", comp_name)
+        for cand in candidates:
+            src, score, mtype = match_one_product_name(cand, prod_index, threshold=threshold)
+            if score > best[1]:
+                best = (src, score, mtype, cand)
+        src, score, mtype, used_cand = best
+        min_score = min(min_score, score)
+        if not src:
+            return None
+        unit_price, price_type = component_price_for_partner(src, display_partner, raw_partner, prod_price_map, exc_price_map)
+        if unit_price <= 0:
+            return None
+        total += unit_price * qty
+        details.append(f"{src} {unit_price:,}원×{qty}")
+
+    return {
+        "price": int(total),
+        "detail": " + ".join(details),
+        "score": int(min_score),
+        "method": "세트/수량 자동계산",
+    }
+
+
+def calculate_internal_component_price(component_string, output_qty, display_partner, raw_partner, prod_df, exc_df, threshold=DEFAULT_MATCH_THRESHOLD):
+    """물류 RAW의 자사상품명 분해라인을 사용해 주문상품명 1건의 공급가를 계산합니다.
+
+    자사상품명은 거래처 제출용 출력명으로 쓰지 않지만, 실제 구성품과 출고량을 알고 있으므로
+    세트 상품 단가 계산에는 가장 안전한 보조근거로 사용합니다.
+    """
+    comp_string = normalize_text(component_string)
+    if not comp_string:
+        return None
+    prod_index = prepare_product_match_index(prod_df)
+    prod_price_map = {normalize_text(r["source_product_name"]): clean_price(r["supply_price"]) for _, r in prod_df.iterrows()}
+    exc_price_map = {(normalize_text(r["partner"]), normalize_text(r["source_product_name"])): clean_price(r["exception_supply_price"]) for _, r in exc_df.iterrows()}
+    qty_base = max(clean_qty(output_qty), 1)
+    total = 0
+    details = []
+    min_score = 100
+    for token in [x for x in comp_string.split(" || ") if normalize_text(x)]:
+        m = re.match(r"(.+?)\s*×\s*(\d+)\s*$", token)
+        if m:
+            comp_name = normalize_text(m.group(1))
+            comp_qty_total = clean_qty(m.group(2))
+        else:
+            comp_name = normalize_text(token)
+            comp_qty_total = 1
+        comp_qty = comp_qty_total / qty_base
+        src, score, mtype = match_one_product_name(comp_name, prod_index, threshold=threshold)
+        min_score = min(min_score, score)
+        if not src:
+            return None
+        unit_price, price_type = component_price_for_partner(src, display_partner, raw_partner, prod_price_map, exc_price_map)
+        if unit_price <= 0:
+            return None
+        total += unit_price * comp_qty
+        qty_label = int(comp_qty) if float(comp_qty).is_integer() else round(comp_qty, 2)
+        details.append(f"{src} {unit_price:,}원×{qty_label}")
+    return {
+        "price": int(round(total)),
+        "detail": " + ".join(details),
+        "score": int(min_score),
+        "method": "RAW 자사상품 구성 자동계산",
+    }
 
 
 def clean_price(v):
@@ -325,16 +538,130 @@ def parse_product_master_excel(file) -> pd.DataFrame:
     return out.drop_duplicates(subset=["source_product_name"], keep="last")
 
 
+def parse_order_qty_from_product_name(name):
+    """RAW 주문상품명에서 주문 수량을 추정합니다.
+
+    물류 RAW는 세트 상품이 자사상품명 기준으로 여러 줄로 쪼개져도 주문상품명은 동일합니다.
+    정산 기준은 주문상품명 1줄이므로, 기본값은 1입니다.
+    단, 플랫폼 상품명 끝에 `[2개]`처럼 주문 수량이 명시된 경우 그 값을 우선 적용합니다.
+    """
+    s = normalize_text(name).replace("＊", "*").replace("×", "x")
+    # 예: ... [2개] /
+    matches = re.findall(r"\[\s*(\d+)\s*개\s*\]", s)
+    if matches:
+        try:
+            return max(int(matches[-1]), 1)
+        except Exception:
+            return 1
+    return 1
+
+
+def infer_output_qty_for_group(group):
+    """RAW 그룹 1건의 정산 수량을 계산합니다.
+
+    - 세트/묶음/수량형 주문상품명은 공급가에 구성 수량을 반영하므로 기본 수량 1
+    - 상품명에 `[n개]`가 있으면 n
+    - 단품이고 RAW가 1줄이면 출고량을 수량으로 사용
+    - RAW가 여러 줄이면 자사상품명 분해로 보고 1
+    """
+    order_name = normalize_text(group["주문 상품명"].iloc[0])
+    bracket_qty = parse_order_qty_from_product_name(order_name)
+    if bracket_qty > 1:
+        return bracket_qty
+    if has_bundle_or_multiplier(order_name):
+        return 1
+    if len(group) == 1 and "출고량" in group.columns:
+        q = clean_qty(group["출고량"].iloc[0])
+        return max(q, 1)
+    return 1
+
+
+def normalize_raw_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    """택배/창고 RAW 파일을 정산 앱 표준 컬럼으로 변환합니다.
+
+    지원 형식
+    1) 이미 가공된 파일: 파트너사/수량/수취인 주소 컬럼 보유
+    2) 실제 RAW 파일: 주문번호2를 파트너사로 사용, 출고량을 수량 후보로 사용,
+       동일 주문상품명이 자사상품명 기준으로 여러 줄 쪼개진 경우 한 줄로 병합
+    """
+    df = df.copy()
+    df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
+
+    # 기존 가공본 형식
+    if set(REQUIRED_RAW_COLS).issubset(set(df.columns)):
+        out = df[REQUIRED_RAW_COLS].copy()
+        return out
+
+    raw_required = ["배송사", "송장번호", "주문일", "주문 상품명", "출고량", "수취인", "수취인 주소"]
+    if not set(raw_required).issubset(set(df.columns)):
+        return pd.DataFrame(columns=REQUIRED_RAW_COLS)
+
+    # RAW의 파트너사 후보: 보통 주문번호2가 실제 파트너/공구명에 해당
+    if "주문번호2" in df.columns:
+        df["파트너사"] = df["주문번호2"].map(normalize_text)
+    elif "주문사" in df.columns:
+        df["파트너사"] = df["주문사"].map(normalize_text)
+    else:
+        df["파트너사"] = ""
+    if "주문사" in df.columns:
+        df["파트너사"] = df["파트너사"].where(df["파트너사"].ne(""), df["주문사"].map(normalize_text))
+
+    # 병합 기준: 자사상품명 분해로 생긴 중복 줄은 같은 주문/송장/수취인/주문상품명 기준으로 1건 처리
+    key_cols = [
+        c for c in [
+            "배송사", "송장번호", "주문번호1", "주문번호2", "주문번호3",
+            "주문 상품코드", "주문 상품명", "주문 옵션1", "주문 옵션2",
+            "주문일", "파트너사", "수취인", "수취인 주소",
+        ] if c in df.columns
+    ]
+    for c in key_cols:
+        df[c] = df[c].map(normalize_text)
+    if "출고량" in df.columns:
+        df["출고량"] = df["출고량"].map(clean_qty)
+
+    rows = []
+    grouped = df.groupby(key_cols, dropna=False, sort=False)
+    for _, g in grouped:
+        first = g.iloc[0].copy()
+        first["수량"] = infer_output_qty_for_group(g)
+        # 검증용 내부 정보. 출력 정산서에는 나오지 않지만 미리보기/디버깅 때 유용함.
+        if "자사 상품명" in g.columns:
+            first["자사상품명_구성"] = " / ".join(sorted(set(g["자사 상품명"].dropna().map(normalize_text))))
+            comp_rows = []
+            for _, gr in g.iterrows():
+                comp_name = normalize_text(gr.get("자사 상품명", ""))
+                comp_qty = clean_qty(gr.get("출고량", 0))
+                if comp_name:
+                    comp_rows.append(f"{comp_name} × {max(comp_qty, 1)}")
+            first["자사상품명_수량구성"] = " || ".join(comp_rows)
+        first["RAW병합라인수"] = len(g)
+        rows.append(first)
+    out = pd.DataFrame(rows)
+    out = out.rename(columns={"출고량": "원본출고량"})
+    for col in REQUIRED_RAW_COLS:
+        if col not in out.columns:
+            out[col] = ""
+    return out[REQUIRED_RAW_COLS + [c for c in ["자사상품명_구성", "자사상품명_수량구성", "RAW병합라인수", "원본출고량"] if c in out.columns]].copy()
+
+
 def read_raw_excel(file) -> pd.DataFrame:
     xl = pd.ExcelFile(file)
     frames = []
+    unsupported_sheets = []
     for sheet in xl.sheet_names:
         df = pd.read_excel(file, sheet_name=sheet)
         df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
-        if set(REQUIRED_RAW_COLS).issubset(set(df.columns)):
-            frames.append(df)
+        norm = normalize_raw_export_df(df)
+        if not norm.empty and set(REQUIRED_RAW_COLS).issubset(set(norm.columns)):
+            frames.append(norm)
+        else:
+            unsupported_sheets.append(sheet)
     if not frames:
-        raise ValueError("필수 컬럼이 있는 시트를 찾지 못했습니다. 필요한 컬럼: " + ", ".join(REQUIRED_RAW_COLS))
+        raise ValueError(
+            "정산 가능한 시트를 찾지 못했습니다.\n"
+            "지원 형식 ① 가공본: " + ", ".join(REQUIRED_RAW_COLS) + "\n"
+            "지원 형식 ② 실제 RAW: 배송사, 송장번호, 주문번호2, 주문일, 주문 상품명, 자사 상품명, 출고량, 수취인, 수취인 주소"
+        )
     df = pd.concat(frames, ignore_index=True)
     for col in REQUIRED_RAW_COLS:
         if col not in df.columns:
@@ -414,6 +741,40 @@ def calculate_settlement(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partne
     df["carton_qty"] = df["carton_qty"].map(clean_qty)
     df["default_shipping_fee"] = df["default_shipping_fee"].map(clean_price).replace(0, DEFAULT_SHIPPING_FEE)
 
+    # 세트/묶음/수량형 상품명 자동 계산
+    # 상품마스터가 단품 기준이어도 RAW 상품명이 '본품+리필', '세정티슈 * 10개' 형태면 단품가를 합산/곱셈하여 공급가를 산출합니다.
+    df["공급가계산방식"] = "상품마스터/예외단가"
+    df["세트구성"] = ""
+    for idx, r in df.iterrows():
+        bundle = None
+        if "자사상품명_수량구성" in df.columns and clean_qty(r.get("RAW병합라인수", 0)) > 1:
+            bundle = calculate_internal_component_price(
+                r.get("자사상품명_수량구성", ""),
+                r.get("수량", 1),
+                r["정산거래처명"],
+                r["원본 파트너사"],
+                prod,
+                exc,
+                threshold=max(70, match_threshold - 15),
+            )
+        if not bundle:
+            bundle = calculate_bundle_price(
+                r["주문 상품명"],
+                r["정산거래처명"],
+                r["원본 파트너사"],
+                prod,
+                exc,
+                threshold=match_threshold,
+            )
+        if bundle:
+            df.at[idx, "공급가"] = bundle["price"]
+            df.at[idx, "공급가계산방식"] = bundle["method"]
+            df.at[idx, "세트구성"] = bundle["detail"]
+            df.at[idx, "매칭방식"] = bundle["method"]
+            df.at[idx, "매칭점수"] = bundle["score"]
+            df.at[idx, "매칭상품명"] = bundle["detail"]
+            df.at[idx, "matched_source_product_name"] = bundle["detail"]
+
     # 합배송 기준: 같은 업체 + 같은 주문일 + 같은 수취인 + 같은 주소
     df["_addr_norm"] = df["수취인 주소"].str.replace(r"\s+", "", regex=True).str.lower()
     df["_ship_group"] = df["파트너사"] + "|" + df["주문일"].fillna("") + "|" + df["수취인"] + "|" + df["_addr_norm"]
@@ -438,7 +799,8 @@ def calculate_settlement(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partne
     for c in OUTPUT_COLS:
         if c not in df.columns:
             df[c] = ""
-    return df[OUTPUT_COLS + ["원본 파트너사", "standard_product_name", "brand", "carton_qty"] + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]].copy()
+    extra_raw_cols = [c for c in ["자사상품명_구성", "자사상품명_수량구성", "RAW병합라인수", "원본출고량"] if c in df.columns]
+    return df[OUTPUT_COLS + extra_raw_cols + ["원본 파트너사", "standard_product_name", "brand", "carton_qty", "공급가계산방식", "세트구성"] + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]].copy()
 
 
 def excel_bytes(df, sheet_name="거래내역서"):
@@ -479,7 +841,8 @@ def summary_excel_bytes(settle_df):
     ).sort_values("총액", ascending=False)
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         summary.to_excel(writer, index=False, sheet_name="거래처별요약")
-        settle_df[OUTPUT_COLS + MATCH_INFO_COLS + ["오류"]].to_excel(writer, index=False, sheet_name="전체거래내역")
+        preview_cols = OUTPUT_COLS + [c for c in ["자사상품명_구성", "자사상품명_수량구성", "RAW병합라인수", "원본출고량", "공급가계산방식", "세트구성"] if c in settle_df.columns] + MATCH_INFO_COLS + ["오류"]
+        settle_df[preview_cols].to_excel(writer, index=False, sheet_name="전체거래내역")
     output.seek(0)
     return output.getvalue()
 
@@ -580,16 +943,16 @@ def page_backup():
 
 def page_settlement():
     st.subheader("정산파일 생성")
-    st.markdown("RAW 출고리스트를 업로드하면 공급가/배송비를 계산하고 업체별 거래내역서 엑셀을 ZIP으로 생성합니다.")
+    st.markdown("RAW 출고리스트를 업로드하면 자사상품명 분해라인을 주문상품명 기준으로 자동 병합하고, 공급가/배송비를 계산한 뒤 업체별 거래내역서 엑셀을 ZIP으로 생성합니다.")
     with st.expander("상품명 자동매칭 설정", expanded=True):
         match_threshold = st.slider("유사매칭 기준점수", min_value=70, max_value=100, value=DEFAULT_MATCH_THRESHOLD, step=1,
                                     help="점수가 낮을수록 더 많이 자동매칭되지만 오매칭 가능성이 커집니다. 실무 권장값은 85~90점입니다.")
-        st.caption("정확히 같은 상품명은 100점으로 바로 매칭하고, 공백/괄호/기호 차이는 정규화 후 매칭합니다. 그 외에는 가장 비슷한 상품명을 자동 추천·적용합니다.")
+        st.caption("정확히 같은 상품명은 100점으로 바로 매칭하고, 공백/괄호/기호 차이는 정규화 후 매칭합니다. 실제 RAW에서 주문상품명 1건이 자사상품명 기준 여러 줄로 쪼개진 경우에도 주문상품명 기준 1건으로 병합하고, 자사상품명 구성 수량을 보조근거로 단가를 자동 계산합니다.")
         partner_threshold = st.slider("파트너사 오타 자동묶음 기준점수", min_value=60, max_value=100, value=DEFAULT_PARTNER_MATCH_THRESHOLD, step=1,
                                       help="점수가 낮을수록 나행/니행, 지앤티/지엔티처럼 비슷한 거래처를 자동으로 같은 정산거래처명으로 묶습니다. 권장값은 75~85점입니다.")
     raw_upload = st.file_uploader("RAW 출고리스트 엑셀 업로드", type=["xlsx"], key="raw_upload")
     if not raw_upload:
-        st.info("필수 컬럼: " + ", ".join(REQUIRED_RAW_COLS))
+        st.info("지원 형식: ① 기존 가공본(파트너사/수량 포함) ② 실제 RAW(주문번호2, 주문 상품명, 자사 상품명, 출고량 포함). 실제 RAW는 자사상품명 분해라인을 주문상품명 기준으로 자동 병합합니다.")
         return
     try:
         raw = read_raw_excel(raw_upload)
@@ -604,7 +967,8 @@ def page_settlement():
         errors = result[result["오류"].fillna("").ne("")]
         if len(errors) > 0:
             st.error(f"확인 필요 데이터 {len(errors):,}건이 있습니다. 아래 오류 데이터부터 처리하세요.")
-            st.dataframe(errors[OUTPUT_COLS + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]], use_container_width=True, height=300)
+            error_cols = OUTPUT_COLS + [c for c in ["자사상품명_수량구성", "RAW병합라인수", "공급가계산방식", "세트구성"] if c in errors.columns] + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]
+            st.dataframe(errors[error_cols], use_container_width=True, height=300)
         else:
             st.success("오류 없이 계산되었습니다.")
         st.markdown("### 상품명 매칭 현황")
@@ -617,7 +981,8 @@ def page_settlement():
         summary = result.groupby("파트너사", as_index=False).agg(출고라인=("송장번호", "count"), 총수량=("수량", "sum"), 상품금액=("상품금액", "sum"), 배송비=("배송비", "sum"), 총액=("총액", "sum")).sort_values("총액", ascending=False)
         st.dataframe(summary, use_container_width=True, height=300)
         st.markdown("### 계산 결과 미리보기")
-        st.dataframe(result[OUTPUT_COLS + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]].head(1000), use_container_width=True, height=420)
+        preview_cols = OUTPUT_COLS + [c for c in ["자사상품명_수량구성", "RAW병합라인수", "공급가계산방식", "세트구성"] if c in result.columns] + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]
+        st.dataframe(result[preview_cols].head(1000), use_container_width=True, height=420)
         st.download_button("업체별 거래내역서 ZIP 다운로드", data=zip_partner_files(result), file_name=f"B2B_업체별_거래내역서_{datetime.now().strftime('%Y%m%d_%H%M')}.zip", mime="application/zip", type="primary")
     except Exception as e:
         st.exception(e)
