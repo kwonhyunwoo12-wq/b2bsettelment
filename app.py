@@ -7,6 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+from rapidfuzz import fuzz, process
 
 APP_TITLE = "터블/키친플래그 B2B 월정산 자동화"
 BASE_DIR = os.path.dirname(__file__)
@@ -16,6 +17,10 @@ DEFAULT_SHIPPING_FEE = 3000
 
 REQUIRED_RAW_COLS = ["배송사", "송장번호", "파트너사", "주문일", "주문 상품명", "수량", "수취인", "수취인 주소"]
 OUTPUT_COLS = ["배송사", "송장번호", "파트너사", "주문일", "주문 상품명", "수량", "공급가", "배송비", "상품금액", "총액", "수취인", "수취인 주소"]
+MATCH_INFO_COLS = ["매칭상품명", "매칭점수", "매칭방식"]
+PARTNER_MATCH_INFO_COLS = ["정산거래처명", "파트너매칭점수", "파트너매칭방식"]
+DEFAULT_MATCH_THRESHOLD = 88
+DEFAULT_PARTNER_MATCH_THRESHOLD = 75
 PRODUCT_COLS = ["source_product_name", "standard_product_name", "brand", "supply_price", "carton_qty", "shipping_fee", "memo"]
 PARTNER_COLS = ["partner", "display_partner", "email", "include_yn", "default_shipping_fee", "memo"]
 EXCEPTION_COLS = ["partner", "source_product_name", "exception_supply_price", "memo"]
@@ -25,6 +30,119 @@ def normalize_text(v):
     if pd.isna(v):
         return ""
     return re.sub(r"\s+", " ", str(v).strip())
+
+
+def canonical_product_name(v):
+    """상품명 유사도 비교용 정규화: 공백/기호/괄호 차이를 최대한 제거합니다."""
+    s = normalize_text(v).lower()
+    s = s.replace("ｐ", "p").replace("－", "-").replace("–", "-").replace("—", "-")
+    s = re.sub(r"\[[^\]]*\]", " ", s)  # [Tubble] 같은 태그 제거
+    s = re.sub(r'[(){}<>\[\]/_+,:;|·ㆍ\\\'"“”‘’]', " ", s)
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+
+
+def canonical_partner_name(v):
+    """거래처명 유사도 비교용 정규화: (특판) 같은 태그/공백/기호 차이를 제거합니다."""
+    s = normalize_text(v).lower()
+    s = re.sub(r"\([^)]*\)", " ", s)  # (특판) 등 제거
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"[^0-9a-z가-힣]", "", s)
+    return s
+
+
+def build_partner_matches(raw_partners, partner_df, threshold=DEFAULT_PARTNER_MATCH_THRESHOLD):
+    """RAW 파트너사를 거래처마스터의 정산거래처명(display_partner)에 정확/유사 매칭합니다."""
+    raw_partners = [normalize_text(x) for x in raw_partners if normalize_text(x)]
+    partner_df = partner_df.copy()
+    if partner_df.empty:
+        return pd.DataFrame({
+            "원본파트너사": sorted(set(raw_partners)),
+            "정산거래처명": sorted(set(raw_partners)),
+            "파트너매칭점수": 100,
+            "파트너매칭방식": "신규등록",
+        })
+    partner_df["display_partner"] = partner_df["display_partner"].fillna("").map(normalize_text)
+    partner_df.loc[partner_df["display_partner"].eq(""), "display_partner"] = partner_df["partner"].map(normalize_text)
+
+    exact_by_raw = {normalize_text(r["partner"]): normalize_text(r["display_partner"]) for _, r in partner_df.iterrows()}
+    choices = []
+    choice_to_display = {}
+    for display in sorted(set(partner_df["display_partner"].dropna().map(normalize_text))):
+        can = canonical_partner_name(display)
+        if can:
+            choices.append(can)
+            choice_to_display.setdefault(can, display)
+
+    rows = []
+    for raw in sorted(set(raw_partners)):
+        raw_norm = normalize_text(raw)
+        raw_can = canonical_partner_name(raw_norm)
+        display = raw_norm
+        score = 0
+        mtype = "신규등록"
+        if raw_norm in exact_by_raw:
+            display, score, mtype = exact_by_raw[raw_norm], 100, "마스터일치"
+        elif choices:
+            hit = process.extractOne(raw_can, choices, scorer=fuzz.WRatio)
+            if hit and hit[1] >= threshold:
+                display, score, mtype = choice_to_display[hit[0]], int(round(hit[1])), "유사거래처묶음"
+            elif hit:
+                display, score, mtype = raw_norm, int(round(hit[1])), "신규등록"
+        rows.append({
+            "원본파트너사": raw_norm,
+            "정산거래처명": display,
+            "파트너매칭점수": score,
+            "파트너매칭방식": mtype,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_product_matches(raw_products, prod_df, threshold=DEFAULT_MATCH_THRESHOLD):
+    """RAW 상품명을 상품마스터에 정확/유사 매칭하여 매칭표를 만듭니다."""
+    raw_products = [normalize_text(x) for x in raw_products if normalize_text(x)]
+    prod_df = prod_df.copy()
+    prod_df["_canon"] = prod_df["source_product_name"].map(canonical_product_name)
+    exact_by_name = {normalize_text(x): normalize_text(x) for x in prod_df["source_product_name"].dropna()}
+    canon_to_source = {}
+    choices = []
+    choice_to_source = {}
+    for _, r in prod_df.iterrows():
+        src = normalize_text(r["source_product_name"])
+        can = r["_canon"]
+        if not src or not can:
+            continue
+        canon_to_source.setdefault(can, src)
+        choices.append(can)
+        choice_to_source.setdefault(can, src)
+
+    rows = []
+    for raw in sorted(set(raw_products)):
+        raw_norm = normalize_text(raw)
+        raw_can = canonical_product_name(raw_norm)
+        matched = ""
+        score = 0
+        mtype = "미매칭"
+        if raw_norm in exact_by_name:
+            matched, score, mtype = exact_by_name[raw_norm], 100, "정확일치"
+        elif raw_can in canon_to_source:
+            matched, score, mtype = canon_to_source[raw_can], 100, "정규화일치"
+        elif choices:
+            hit = process.extractOne(raw_can, choices, scorer=fuzz.WRatio)
+            if hit and hit[1] >= threshold:
+                matched, score, mtype = choice_to_source[hit[0]], int(round(hit[1])), "유사매칭"
+            elif hit:
+                matched, score, mtype = "", int(round(hit[1])), "미매칭"
+        rows.append({
+            "주문 상품명": raw_norm,
+            "matched_source_product_name": matched,
+            "매칭상품명": matched,
+            "매칭점수": score,
+            "매칭방식": mtype,
+        })
+    return pd.DataFrame(rows)
 
 
 def clean_price(v):
@@ -224,23 +342,34 @@ def read_raw_excel(file) -> pd.DataFrame:
     return df.copy()
 
 
-def ensure_partners(raw_df):
-    partners = sorted(raw_df["파트너사"].dropna().map(normalize_text).unique())
-    existing = set(read_table("partner_master", PARTNER_COLS)["partner"].tolist())
-    new = [p for p in partners if p and p not in existing]
-    if new:
-        df = pd.DataFrame({
-            "partner": new,
-            "display_partner": new,
-            "email": "",
-            "include_yn": "Y",
-            "default_shipping_fee": DEFAULT_SHIPPING_FEE,
-            "memo": "RAW 업로드 시 자동 추가",
-        })
+def ensure_partners(raw_df, partner_threshold=DEFAULT_PARTNER_MATCH_THRESHOLD):
+    raw_partners = sorted(raw_df["파트너사"].dropna().map(normalize_text).unique())
+    partners_df = read_table("partner_master", PARTNER_COLS)
+    existing_raw = set(partners_df["partner"].map(normalize_text).tolist())
+    new_raw = [p for p in raw_partners if p and p not in existing_raw]
+    if new_raw:
+        # 기존 마스터 및 이번에 추가되는 거래처를 보며 비슷한 거래처는 같은 정산거래처명으로 자동 묶습니다.
+        rows = []
+        working = partners_df.copy()
+        for p in new_raw:
+            match = build_partner_matches([p], working, threshold=partner_threshold)
+            display = match.iloc[0]["정산거래처명"] if len(match) else p
+            score = match.iloc[0]["파트너매칭점수"] if len(match) else 0
+            mtype = match.iloc[0]["파트너매칭방식"] if len(match) else "신규등록"
+            rows.append({
+                "partner": p,
+                "display_partner": display,
+                "email": "",
+                "include_yn": "Y",
+                "default_shipping_fee": DEFAULT_SHIPPING_FEE,
+                "memo": f"RAW 업로드 시 자동 추가 / {mtype} / score={score}",
+            })
+            working = pd.concat([working, pd.DataFrame([rows[-1]])], ignore_index=True)
+        df = pd.DataFrame(rows)
         upsert_table("partner_master", df[PARTNER_COLS], PARTNER_COLS, ["partner"])
 
 
-def calculate_settlement(raw_df):
+def calculate_settlement(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partner_threshold=DEFAULT_PARTNER_MATCH_THRESHOLD):
     prod = read_table("product_master", PRODUCT_COLS)
     partners = read_table("partner_master", PARTNER_COLS)
     exc = read_table("price_exception", EXCEPTION_COLS)
@@ -248,20 +377,39 @@ def calculate_settlement(raw_df):
     df = raw_df.copy()
     for col in ["배송사", "송장번호", "파트너사", "주문 상품명", "수취인", "수취인 주소"]:
         df[col] = df[col].map(normalize_text)
+    df["원본 파트너사"] = df["파트너사"]
     df["수량"] = df["수량"].map(clean_qty)
     df["주문일"] = pd.to_datetime(df["주문일"], errors="coerce").dt.strftime("%Y-%m-%d")
 
+    match_df = build_product_matches(df["주문 상품명"].dropna().unique(), prod, threshold=match_threshold)
+    df = df.merge(match_df, how="left", on="주문 상품명")
     df = df.merge(prod[["source_product_name", "standard_product_name", "brand", "supply_price", "carton_qty", "shipping_fee"]],
-                  how="left", left_on="주문 상품명", right_on="source_product_name")
+                  how="left", left_on="matched_source_product_name", right_on="source_product_name")
     df = df.merge(partners[["partner", "display_partner", "include_yn", "default_shipping_fee"]],
                   how="left", left_on="파트너사", right_on="partner")
-    df = df.merge(exc[["partner", "source_product_name", "exception_supply_price"]],
-                  how="left", left_on=["파트너사", "주문 상품명"], right_on=["partner", "source_product_name"], suffixes=("", "_exc"))
+    df["display_partner"] = df["display_partner"].fillna(df["파트너사"]).map(normalize_text)
+
+    # 파트너사 오타/표기차이는 거래처마스터의 display_partner(정산거래처명) 기준으로 묶습니다.
+    partner_match_df = build_partner_matches(df["파트너사"].dropna().unique(), partners, threshold=partner_threshold)
+    df = df.merge(partner_match_df, how="left", left_on="파트너사", right_on="원본파트너사")
+    df["정산거래처명"] = df["정산거래처명"].fillna(df["display_partner"]).map(normalize_text)
+    df["파트너매칭점수"] = df["파트너매칭점수"].fillna(100).astype(int)
+    df["파트너매칭방식"] = df["파트너매칭방식"].fillna("마스터일치")
+
+    # 예외단가는 정산거래처명 기준 우선, 없으면 RAW 파트너사 기준으로 한 번 더 찾습니다.
+    exc_display = exc.rename(columns={"partner": "exc_partner_display", "source_product_name": "exc_product_display", "exception_supply_price": "exception_supply_price_display"})
+    df = df.merge(exc_display[["exc_partner_display", "exc_product_display", "exception_supply_price_display"]],
+                  how="left", left_on=["정산거래처명", "matched_source_product_name"], right_on=["exc_partner_display", "exc_product_display"])
+    exc_raw = exc.rename(columns={"partner": "exc_partner_raw", "source_product_name": "exc_product_raw", "exception_supply_price": "exception_supply_price_raw"})
+    df = df.merge(exc_raw[["exc_partner_raw", "exc_product_raw", "exception_supply_price_raw"]],
+                  how="left", left_on=["원본 파트너사", "matched_source_product_name"], right_on=["exc_partner_raw", "exc_product_raw"])
 
     df["include_yn"] = df["include_yn"].fillna("Y").astype(str).str.upper().str[:1]
     df = df[df["include_yn"].eq("Y")].copy()
 
-    df["공급가"] = df["exception_supply_price"].where(df["exception_supply_price"].notna(), df["supply_price"])
+    df["공급가"] = df["exception_supply_price_display"].where(df["exception_supply_price_display"].notna(), df["exception_supply_price_raw"])
+    df["공급가"] = df["공급가"].where(df["공급가"].notna(), df["supply_price"])
+    df["파트너사"] = df["정산거래처명"]
     df["공급가"] = df["공급가"].map(clean_price)
     df["carton_qty"] = df["carton_qty"].map(clean_qty)
     df["default_shipping_fee"] = df["default_shipping_fee"].map(clean_price).replace(0, DEFAULT_SHIPPING_FEE)
@@ -282,7 +430,7 @@ def calculate_settlement(raw_df):
     df["상품금액"] = df["수량"].astype(int) * df["공급가"].astype(int)
     df["총액"] = df["상품금액"] + df["배송비"].astype(int)
     df["오류"] = ""
-    df.loc[df["source_product_name"].isna(), "오류"] += "상품마스터 미매칭; "
+    df.loc[df["matched_source_product_name"].fillna("").eq(""), "오류"] += "상품마스터 미매칭; "
     df.loc[df["공급가"].eq(0), "오류"] += "공급가 누락/0원; "
     df.loc[df["수량"].le(0), "오류"] += "수량 오류; "
     df.loc[df["주문일"].isna() | df["주문일"].eq("NaT"), "오류"] += "주문일 오류; "
@@ -290,7 +438,7 @@ def calculate_settlement(raw_df):
     for c in OUTPUT_COLS:
         if c not in df.columns:
             df[c] = ""
-    return df[OUTPUT_COLS + ["standard_product_name", "brand", "carton_qty", "오류"]].copy()
+    return df[OUTPUT_COLS + ["원본 파트너사", "standard_product_name", "brand", "carton_qty"] + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]].copy()
 
 
 def excel_bytes(df, sheet_name="거래내역서"):
@@ -331,7 +479,7 @@ def summary_excel_bytes(settle_df):
     ).sort_values("총액", ascending=False)
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         summary.to_excel(writer, index=False, sheet_name="거래처별요약")
-        settle_df[OUTPUT_COLS + ["오류"]].to_excel(writer, index=False, sheet_name="전체거래내역")
+        settle_df[OUTPUT_COLS + MATCH_INFO_COLS + ["오류"]].to_excel(writer, index=False, sheet_name="전체거래내역")
     output.seek(0)
     return output.getvalue()
 
@@ -433,14 +581,20 @@ def page_backup():
 def page_settlement():
     st.subheader("정산파일 생성")
     st.markdown("RAW 출고리스트를 업로드하면 공급가/배송비를 계산하고 업체별 거래내역서 엑셀을 ZIP으로 생성합니다.")
+    with st.expander("상품명 자동매칭 설정", expanded=True):
+        match_threshold = st.slider("유사매칭 기준점수", min_value=70, max_value=100, value=DEFAULT_MATCH_THRESHOLD, step=1,
+                                    help="점수가 낮을수록 더 많이 자동매칭되지만 오매칭 가능성이 커집니다. 실무 권장값은 85~90점입니다.")
+        st.caption("정확히 같은 상품명은 100점으로 바로 매칭하고, 공백/괄호/기호 차이는 정규화 후 매칭합니다. 그 외에는 가장 비슷한 상품명을 자동 추천·적용합니다.")
+        partner_threshold = st.slider("파트너사 오타 자동묶음 기준점수", min_value=60, max_value=100, value=DEFAULT_PARTNER_MATCH_THRESHOLD, step=1,
+                                      help="점수가 낮을수록 나행/니행, 지앤티/지엔티처럼 비슷한 거래처를 자동으로 같은 정산거래처명으로 묶습니다. 권장값은 75~85점입니다.")
     raw_upload = st.file_uploader("RAW 출고리스트 엑셀 업로드", type=["xlsx"], key="raw_upload")
     if not raw_upload:
         st.info("필수 컬럼: " + ", ".join(REQUIRED_RAW_COLS))
         return
     try:
         raw = read_raw_excel(raw_upload)
-        ensure_partners(raw)
-        result = calculate_settlement(raw)
+        ensure_partners(raw, partner_threshold=partner_threshold)
+        result = calculate_settlement(raw, match_threshold=match_threshold, partner_threshold=partner_threshold)
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("정산 거래처", f"{result['파트너사'].nunique():,}개")
         c2.metric("출고 라인", f"{len(result):,}건")
@@ -450,14 +604,20 @@ def page_settlement():
         errors = result[result["오류"].fillna("").ne("")]
         if len(errors) > 0:
             st.error(f"확인 필요 데이터 {len(errors):,}건이 있습니다. 아래 오류 데이터부터 처리하세요.")
-            st.dataframe(errors[OUTPUT_COLS + ["오류"]], use_container_width=True, height=300)
+            st.dataframe(errors[OUTPUT_COLS + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]], use_container_width=True, height=300)
         else:
             st.success("오류 없이 계산되었습니다.")
+        st.markdown("### 상품명 매칭 현황")
+        match_summary = result.groupby(["주문 상품명", "매칭상품명", "매칭방식"], dropna=False, as_index=False).agg(라인수=("송장번호", "count"), 매칭점수=("매칭점수", "max"))
+        st.dataframe(match_summary.sort_values(["매칭방식", "매칭점수"], ascending=[True, False]), use_container_width=True, height=260)
+        st.markdown("### 파트너사 자동묶음 현황")
+        partner_summary = result.groupby(["원본 파트너사", "정산거래처명", "파트너매칭방식"], dropna=False, as_index=False).agg(라인수=("송장번호", "count"), 파트너매칭점수=("파트너매칭점수", "max"))
+        st.dataframe(partner_summary.sort_values(["파트너매칭방식", "파트너매칭점수"], ascending=[True, False]), use_container_width=True, height=220)
         st.markdown("### 거래처별 요약")
         summary = result.groupby("파트너사", as_index=False).agg(출고라인=("송장번호", "count"), 총수량=("수량", "sum"), 상품금액=("상품금액", "sum"), 배송비=("배송비", "sum"), 총액=("총액", "sum")).sort_values("총액", ascending=False)
         st.dataframe(summary, use_container_width=True, height=300)
         st.markdown("### 계산 결과 미리보기")
-        st.dataframe(result[OUTPUT_COLS + ["오류"]].head(1000), use_container_width=True, height=420)
+        st.dataframe(result[OUTPUT_COLS + MATCH_INFO_COLS + PARTNER_MATCH_INFO_COLS + ["오류"]].head(1000), use_container_width=True, height=420)
         st.download_button("업체별 거래내역서 ZIP 다운로드", data=zip_partner_files(result), file_name=f"B2B_업체별_거래내역서_{datetime.now().strftime('%Y%m%d_%H%M')}.zip", mime="application/zip", type="primary")
     except Exception as e:
         st.exception(e)
