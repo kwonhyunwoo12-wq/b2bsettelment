@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz, process
 
-APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v9"
+APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v11"
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "b2b_settlement.db")
 SEED_PRODUCT_PATH = os.path.join(BASE_DIR, "seed_data", "product_master.csv")
@@ -590,20 +590,40 @@ def parse_order_qty_from_product_name(name):
 def infer_output_qty_for_group(group):
     """RAW 그룹 1건의 정산 수량을 계산합니다.
 
-    - 세트/묶음/수량형 주문상품명은 공급가에 구성 수량을 반영하므로 기본 수량 1
+    물류 RAW는 하나의 주문상품이 자사상품명 기준으로 여러 줄 분해될 수 있습니다.
+    예) 세탁 2종 선물세트 28개 출고 → 단상자 28 / 모닝머스크 28 / 코튼가든 28
+    이때 정산 수량은 1이 아니라 28이어야 하므로, 여러 구성품 출고량의 최대공약수(GCD)를
+    주문상품 수량으로 추정합니다.
+
     - 상품명에 `[n개]`가 있으면 n
-    - 단품이고 RAW가 1줄이면 출고량을 수량으로 사용
-    - RAW가 여러 줄이면 자사상품명 분해로 보고 1
+    - 단품이고 RAW가 1줄이면 출고량
+    - RAW가 여러 줄이면 출고량들의 최대공약수
+      · 본품 2 + 실속팩 1 → GCD(2,1)=1
+      · 선물세트 28개 → GCD(28,28,28)=28
+      · 3종세트 28개(본품28/리필56/박스28) → GCD(28,56,28)=28
     """
+    import math
+
     order_name = normalize_text(group["주문 상품명"].iloc[0])
     bracket_qty = parse_order_qty_from_product_name(order_name)
     if bracket_qty > 1:
         return bracket_qty
-    if has_bundle_or_multiplier(order_name):
-        return 1
-    if len(group) == 1 and "출고량" in group.columns:
-        q = clean_qty(group["출고량"].iloc[0])
-        return max(q, 1)
+
+    if "출고량" in group.columns:
+        qtys = [clean_qty(x) for x in group["출고량"].tolist()]
+        qtys = [int(q) for q in qtys if q and q > 0]
+    else:
+        qtys = []
+
+    if len(group) == 1:
+        return max(qtys[0], 1) if qtys else 1
+
+    if qtys:
+        gcd_qty = qtys[0]
+        for q in qtys[1:]:
+            gcd_qty = math.gcd(gcd_qty, q)
+        return max(gcd_qty, 1)
+
     return 1
 
 
@@ -737,6 +757,13 @@ def calculate_settlement(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partne
         df[col] = df[col].map(normalize_text)
     df["원본 파트너사"] = df["파트너사"]
     df["수량"] = df["수량"].map(clean_qty)
+    # RAW 단일 라인 보정: 주문상품명 1줄이 자사상품명 1줄로만 들어온 경우에는
+    # 정산 수량이 반드시 원본 출고량과 동일해야 합니다.
+    # 예) 포밍 주방세제 본품 출고량 2 -> 거래내역서 수량 2, 공급가 단가 4,350, 상품금액 8,700
+    if "RAW병합라인수" in df.columns and "원본출고량" in df.columns:
+        raw_one_line = df["RAW병합라인수"].map(clean_qty).eq(1)
+        raw_qty = df["원본출고량"].map(clean_qty)
+        df.loc[raw_one_line & raw_qty.gt(0), "수량"] = raw_qty[raw_one_line & raw_qty.gt(0)]
     df["주문일"] = pd.to_datetime(df["주문일"], errors="coerce").dt.strftime("%Y-%m-%d")
 
     match_df = build_product_matches(df["주문 상품명"].dropna().unique(), prod, threshold=match_threshold)
