@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz, process
 
-APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v11"
+APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v13"
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "b2b_settlement.db")
 SEED_PRODUCT_PATH = os.path.join(BASE_DIR, "seed_data", "product_master.csv")
@@ -591,6 +591,7 @@ def parse_component_qtys_from_product_name(name):
     """주문상품명 안에 포함된 세트 구성 수량을 추출합니다.
 
     예) 모닝5개+코튼5개 세트 -> [5, 5]
+        모닝5팩+코튼5팩 -> [5, 5]
         본품(30정) X 2개 + 실속팩(100정) X 1개 -> [2, 1]
         세정티슈 * 10개 -> [10]
 
@@ -607,8 +608,9 @@ def parse_component_qtys_from_product_name(name):
     found = []
     spans = []
 
-    # X 2개, * 10개, x1ea 형태
-    for m in re.finditer(r"(?:x|\*)\s*(\d+)\s*(?:개|ea|입)?", s):
+    # X 2개, * 10개, x1ea, X 5팩 형태
+    # 단, 35개입/30정/100정 같은 제품 규격은 세트 수량으로 보지 않도록 별도 처리합니다.
+    for m in re.finditer(r"(?:x|\*)\s*(\d+)\s*(?:개(?!입)|팩|ea|set|세트|입)?", s):
         if overlapped(m.span(), bracket_spans):
             continue
         q = int(m.group(1))
@@ -616,8 +618,9 @@ def parse_component_qtys_from_product_name(name):
             found.append(q)
             spans.append(m.span())
 
-    # 모닝5개, 코튼 5개, 10개 세트 형태
-    for m in re.finditer(r"(?<!\d)(\d+)\s*개", s):
+    # 모닝5개, 코튼 5개, 모닝5팩, 코튼5팩, 10개 세트 형태
+    # '아쿠아블루(35개입)' 같은 규격 표기는 제외하기 위해 '개' 뒤에 '입'이 바로 붙으면 제외합니다.
+    for m in re.finditer(r"(?<!\d)(\d+)\s*(?:개(?!입)|팩|세트|묶음)", s):
         if overlapped(m.span(), bracket_spans) or overlapped(m.span(), spans):
             continue
         q = int(m.group(1))
