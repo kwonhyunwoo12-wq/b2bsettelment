@@ -9,10 +9,11 @@ import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz, process
 
-APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v13"
+APP_TITLE = "터블/키친플래그 B2B 월정산 자동화 v14"
 BASE_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE_DIR, "b2b_settlement.db")
 SEED_PRODUCT_PATH = os.path.join(BASE_DIR, "seed_data", "product_master.csv")
+SEED_COST_PATH = os.path.join(BASE_DIR, "seed_data", "cost_master.csv")
 DEFAULT_SHIPPING_FEE = 3000
 
 REQUIRED_RAW_COLS = ["배송사", "송장번호", "파트너사", "주문일", "주문 상품명", "수량", "수취인", "수취인 주소"]
@@ -177,10 +178,26 @@ def extract_bundle_expression(name):
     s = normalize_text(name).replace("＊", "*").replace("×", "x").replace("＋", "+").replace("&", "+")
     brackets = re.findall(r"\[([^\]]+)\]", s)
     for b in reversed(brackets):
-        if "+" in b or re.search(r"(?:\*|x|X)\s*\d+\s*개?", b):
+        if "+" in b or re.search(r"(?:\*|x|X)\s*\d+\s*(?:개|팩|ea|set)?", b):
             return normalize_text(b)
     # 판매명 안에서 슬래시가 세트 구분자로 쓰인 경우도 일부 있으므로 +처럼 처리
     # 단, URL/규격에는 거의 사용하지 않는 업무 데이터 기준의 보조 처리입니다.
+    return s
+
+
+def is_slash_bundle_separator(s):
+    """본품/리필처럼 슬래시가 세트 구분자인 경우만 True.
+
+    (본품/500ml), (스타터팩/10P) 같은 규격 슬래시는 세트 구분자로 보지 않습니다.
+    """
+    s = normalize_text(s)
+    return bool(re.search(r"[가-힣a-zA-Z)]\s*/\s*[가-힣a-zA-Z]", s)) and not bool(re.search(r"/\s*\d", s))
+
+
+def normalize_bundle_separators(s):
+    s = normalize_text(s).replace("＋", "+").replace("&", "+")
+    if is_slash_bundle_separator(s):
+        s = re.sub(r"\s*/\s*", "+", s)
     return s
 
 
@@ -188,11 +205,11 @@ def has_bundle_or_multiplier(name):
     """상품명에 세트/묶음/수량 배수 계산이 필요한 패턴이 있는지 판단합니다."""
     s = extract_bundle_expression(name).lower().replace("＊", "*").replace("×", "x")
     return bool(
-        re.search(r"[+/]", s)
-        or re.search(r"(?:\*|x)\s*\d+\s*개?", s)
-        or re.search(r"\d+\s*개\s*(?:세트|묶음|입|구성)?", s)
+        "+" in s
+        or is_slash_bundle_separator(s)
+        or re.search(r"(?:\*|x)\s*\d+\s*(?:개|팩|ea|set)?", s)
+        or re.search(r"\d+\s*(?:개|팩)\s*(?:세트|묶음|입|구성)?", s)
     )
-
 
 def strip_qty_token(part):
     """컴포넌트명에서 '*10개', '10개 세트' 같은 수량표현을 제거하고 배수를 반환합니다."""
@@ -200,16 +217,16 @@ def strip_qty_token(part):
     s = re.sub(r"^\s*\d+[-–—]\d+\)\s*", " ", s)  # 2-2) 같은 옵션번호 제거
     s = s.replace("[", " ").replace("]", " ").replace("/", " ")
     qty = 1
-    m = re.search(r"(?:\*|x|X)\s*(\d+)\s*개?", s)
+    m = re.search(r"(?:\*|x|X)\s*(\d+)\s*(?:개|팩|ea|set)?", s)
     if m:
         qty = int(m.group(1))
-        s = re.sub(r"(?:\*|x|X)\s*\d+\s*개?", " ", s)
+        s = re.sub(r"(?:\*|x|X)\s*\d+\s*(?:개|팩|ea|set)?", " ", s)
     else:
         # 30P, 20매 같은 규격 숫자는 건드리지 않고, '10개', '2개 세트'처럼 '개'가 붙은 경우만 배수로 봅니다.
-        m = re.search(r"(\d+)\s*개\s*(?:세트|묶음|입|구성)?", s)
+        m = re.search(r"(\d+)\s*(?:개|팩)\s*(?:세트|묶음|입|구성)?", s)
         if m:
             qty = int(m.group(1))
-            s = re.sub(r"\d+\s*개\s*(?:세트|묶음|입|구성)?", " ", s)
+            s = re.sub(r"\d+\s*(?:개|팩)\s*(?:세트|묶음|입|구성)?", " ", s)
     s = re.sub(r"\b(set|bundle)\b", " ", s, flags=re.I)
     s = re.sub(r"세트|묶음|구성", " ", s)
     return normalize_text(s), max(qty, 1)
@@ -220,6 +237,35 @@ def common_bundle_prefix(first_part):
     s, _ = strip_qty_token(first_part)
     s = re.sub(r"본품|리필|단품|낱개|추가|옵션", " ", s)
     return normalize_text(s)
+
+
+def component_name_candidates(name):
+    """짧은 구성품명/별칭을 실제 상품명에 잘 붙도록 후보를 확장합니다."""
+    base = normalize_text(name)
+    if not base:
+        return []
+    candidates = [base]
+    low = normalize_brand_aliases(base)
+    alias_pairs = [
+        ("모닝", "모닝머스크"),
+        ("코튼", "코튼가든"),
+        ("세정티슈", "파워클린 다목적 세정티슈"),
+        ("스타터", "텀블러 세정제 스타터팩"),
+        ("실속", "텀블러 세정제 실속팩"),
+    ]
+    for short, full in alias_pairs:
+        if short in low and full not in low:
+            candidates.append(re.sub(short, full, base, flags=re.I))
+            candidates.append(full)
+    # 중복 제거
+    out = []
+    seen = set()
+    for c in candidates:
+        cn = normalize_text(c)
+        if cn and cn not in seen:
+            out.append(cn)
+            seen.add(cn)
+    return out
 
 
 def prepare_product_match_index(prod_df):
@@ -287,9 +333,7 @@ def calculate_bundle_price(raw_product_name, display_partner, raw_partner, prod_
     prod_price_map = {normalize_text(r["source_product_name"]): clean_price(r["supply_price"]) for _, r in prod_df.iterrows()}
     exc_price_map = {(normalize_text(r["partner"]), normalize_text(r["source_product_name"])): clean_price(r["exception_supply_price"]) for _, r in exc_df.iterrows()}
 
-    raw_std = extract_bundle_expression(raw_name).replace("＋", "+").replace("&", "+")
-    # 상품명에 '/'가 세트 구성 구분자로 쓰인 경우도 +처럼 처리합니다.
-    raw_std = re.sub(r"\s*/\s*", "+", raw_std)
+    raw_std = normalize_bundle_separators(extract_bundle_expression(raw_name))
     parts = [normalize_text(x) for x in raw_std.split("+") if normalize_text(x)]
     if not parts:
         return None
@@ -450,6 +494,8 @@ def init_db():
         )
         c.commit()
     seed_products_if_empty()
+    seed_costs_from_seed_if_needed()
+    apply_data_migrations()
 
 
 def read_table(table, cols):
@@ -522,6 +568,68 @@ def seed_products_if_empty():
             replace_table("product_master", seed, PRODUCT_COLS)
         except Exception:
             pass
+
+
+def seed_costs_from_seed_if_needed():
+    """배포 패키지에 포함된 원가마스터를 최초/빈 원가에 자동 반영합니다.
+
+    사용자가 이미 원가를 직접 수정한 경우에는 덮어쓰지 않고, 원가가 없거나 0원인 상품만 채웁니다.
+    """
+    if not os.path.exists(SEED_COST_PATH):
+        return
+    try:
+        seed = pd.read_csv(SEED_COST_PATH)
+    except Exception:
+        return
+    if seed.empty:
+        return
+    for col in COST_COLS:
+        if col not in seed.columns:
+            seed[col] = ""
+    seed = seed[COST_COLS].copy()
+    seed["source_product_name"] = seed["source_product_name"].map(normalize_text)
+    seed["standard_product_name"] = seed["standard_product_name"].map(normalize_text)
+    seed["brand"] = seed["brand"].map(normalize_text)
+    seed["cost_price"] = seed["cost_price"].map(clean_price)
+    seed["memo"] = seed["memo"].map(normalize_text)
+    seed = seed[seed["source_product_name"].ne("") & seed["cost_price"].gt(0)]
+    if seed.empty:
+        return
+    with conn() as c:
+        for _, r in seed.iterrows():
+            src = normalize_text(r["source_product_name"])
+            existing = c.execute("SELECT cost_price FROM cost_master WHERE source_product_name = ?", (src,)).fetchone()
+            if existing is None:
+                c.execute(
+                    "INSERT INTO cost_master (source_product_name, standard_product_name, brand, cost_price, memo) VALUES (?, ?, ?, ?, ?)",
+                    (src, normalize_text(r["standard_product_name"]), normalize_text(r["brand"]), int(r["cost_price"]), normalize_text(r["memo"])),
+                )
+            elif clean_price(existing[0]) <= 0:
+                c.execute(
+                    "UPDATE cost_master SET standard_product_name = ?, brand = ?, cost_price = ?, memo = ? WHERE source_product_name = ?",
+                    (normalize_text(r["standard_product_name"]), normalize_text(r["brand"]), int(r["cost_price"]), normalize_text(r["memo"]), src),
+                )
+        c.commit()
+
+
+def apply_data_migrations():
+    """업무 기준 변경분을 기존 DB에도 안전하게 반영합니다."""
+    try:
+        with conn() as c:
+            # 터블 세정티슈(60매) 공급가 변경: 1,650원 → 1,900원
+            # 사용자가 이미 다른 가격으로 수정한 경우는 건드리지 않고, 기존 1,650원인 경우만 보정합니다.
+            c.execute(
+                """
+                UPDATE product_master
+                   SET supply_price = 1900,
+                       memo = COALESCE(memo, '') || ' / 공급가 변경 1650→1900'
+                 WHERE supply_price = 1650
+                   AND (source_product_name LIKE '%세정티슈%' OR standard_product_name LIKE '%세정티슈%')
+                """
+            )
+            c.commit()
+    except Exception:
+        pass
 
 
 def find_header_row(raw_df):
@@ -1097,31 +1205,67 @@ def ensure_cost_master_from_products():
         upsert_table("cost_master", pd.DataFrame(new_rows), COST_COLS, ["source_product_name"])
 
 
+def find_cost_header_row(raw_df):
+    for i in range(min(len(raw_df), 40)):
+        vals = [str(x).replace("\n", "").strip() for x in raw_df.iloc[i].tolist()]
+        joined = "|".join(vals)
+        if "상품명" in joined and "원가" in joined:
+            return i
+    return None
+
+
 def parse_cost_excel(file):
-    """원가표 엑셀을 유연하게 읽습니다. 상품명/원가 컬럼이 있으면 cost_master 형식으로 변환합니다."""
+    """원가표 엑셀을 유연하게 읽습니다.
+
+    일반 표 형태뿐 아니라, 상단에 제목/공란이 있고 중간 행에 '상품명/원가' 헤더가 있는 파일도 인식합니다.
+    """
     xl = pd.ExcelFile(file)
     rows = []
     for sheet in xl.sheet_names:
-        df = pd.read_excel(file, sheet_name=sheet)
-        df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
-        product_col = next((c for c in df.columns if c in ["source_product_name", "상품명", "자사 상품명", "자사상품명"] or "상품명" in str(c)), None)
-        cost_col = next((c for c in df.columns if c in ["cost_price", "원가"] or "원가" in str(c)), None)
-        brand_col = next((c for c in df.columns if c in ["brand", "브랜드"] or "브랜드" in str(c)), None)
-        std_col = next((c for c in df.columns if c in ["standard_product_name", "표준상품명"] or "표준" in str(c)), None)
-        if not product_col or not cost_col:
-            continue
-        temp = pd.DataFrame()
-        temp["source_product_name"] = df[product_col].map(normalize_text)
-        temp["standard_product_name"] = df[std_col].map(normalize_text) if std_col else temp["source_product_name"]
-        temp["brand"] = df[brand_col].map(normalize_text) if brand_col else ""
-        temp["cost_price"] = df[cost_col].map(clean_price)
-        temp["memo"] = f"원가표 업로드: {sheet}"
-        temp = temp[temp["source_product_name"].ne("")]
-        rows.append(temp[COST_COLS])
+        # 1차: 일반 헤더 형태
+        candidates = []
+        try:
+            df1 = pd.read_excel(file, sheet_name=sheet)
+            candidates.append(df1)
+        except Exception:
+            pass
+        # 2차: 중간 헤더 탐색 형태
+        try:
+            raw = pd.read_excel(file, sheet_name=sheet, header=None)
+            header_row = find_cost_header_row(raw)
+            if header_row is not None:
+                header = raw.iloc[header_row].astype(str).str.replace("\n", "", regex=False).str.strip().tolist()
+                df2 = raw.iloc[header_row + 1 :].copy()
+                df2.columns = header
+                candidates.append(df2)
+        except Exception:
+            pass
+
+        for df in candidates:
+            if df is None or df.empty:
+                continue
+            df = df.copy()
+            df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
+            product_col = next((c for c in df.columns if c in ["source_product_name", "상품명", "자사 상품명", "자사상품명"] or "상품명" in str(c)), None)
+            cost_col = next((c for c in df.columns if c in ["cost_price", "원가"] or "원가" in str(c)), None)
+            brand_col = next((c for c in df.columns if c in ["brand", "브랜드"] or "브랜드" in str(c)), None)
+            std_col = next((c for c in df.columns if c in ["standard_product_name", "표준상품명"] or "표준" in str(c)), None)
+            if not product_col or not cost_col:
+                continue
+            temp = pd.DataFrame()
+            temp["source_product_name"] = df[product_col].map(normalize_text)
+            temp["standard_product_name"] = df[std_col].map(normalize_text) if std_col else temp["source_product_name"]
+            temp["brand"] = df[brand_col].map(normalize_text) if brand_col else temp["source_product_name"].map(lambda x: "키친플래그" if "키친" in normalize_brand_aliases(x) else ("터블" if "터블" in normalize_brand_aliases(x) else ""))
+            temp["cost_price"] = df[cost_col].map(clean_price)
+            temp["memo"] = f"원가표 업로드: {sheet}"
+            temp = temp[temp["source_product_name"].ne("")]
+            temp = temp[temp["cost_price"].gt(0)]
+            if not temp.empty:
+                rows.append(temp[COST_COLS])
+                break
     if not rows:
         return pd.DataFrame(columns=COST_COLS)
     return pd.concat(rows, ignore_index=True).drop_duplicates(subset=["source_product_name"], keep="last")
-
 
 def explode_cost_components(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partner_threshold=DEFAULT_PARTNER_MATCH_THRESHOLD):
     """정산 RAW를 실제 출고 단품 기준으로 풀어서 거래처별 원가계산용 데이터로 만듭니다."""
@@ -1183,6 +1327,295 @@ def explode_cost_components(raw_df, match_threshold=DEFAULT_MATCH_THRESHOLD, par
     out = pd.DataFrame(rows)
     # 수량은 엑셀/화면에서 보기 좋게 정수 가능하면 정수로 표시
     out["수량"] = out["수량"].map(lambda x: int(x) if float(x).is_integer() else round(float(x), 2))
+    return out
+
+
+def calculate_bundle_cost(raw_product_name, cost_df, threshold=DEFAULT_MATCH_THRESHOLD):
+    """거래내역서의 세트/수량형 상품명을 원가마스터 단품 원가로 계산합니다."""
+    raw_name = normalize_text(raw_product_name)
+    if not has_bundle_or_multiplier(raw_name):
+        return None
+    if cost_df.empty:
+        return None
+    cost_index = prepare_product_match_index(cost_df.rename(columns={"cost_price": "supply_price"}))
+    cost_map = {normalize_text(r["source_product_name"]): clean_price(r["cost_price"]) for _, r in cost_df.iterrows()}
+
+    raw_std = normalize_bundle_separators(extract_bundle_expression(raw_name))
+    parts = [normalize_text(x) for x in raw_std.split("+") if normalize_text(x)]
+    if not parts:
+        return None
+
+    prefix = common_bundle_prefix(parts[0]) if len(parts) >= 2 else ""
+    total = 0
+    details = []
+    min_score = 100
+    for i, part in enumerate(parts):
+        comp_name, qty = strip_qty_token(part)
+        candidates = []
+        for cand in component_name_candidates(comp_name):
+            candidates.append(cand)
+        if i > 0 and prefix and len(canonical_product_name(comp_name)) <= 8:
+            for cand in component_name_candidates(normalize_text(prefix + " " + comp_name)):
+                candidates.insert(0, cand)
+        best = ("", 0, "미매칭", comp_name)
+        for cand in candidates:
+            src, score, mtype = match_one_product_name(cand, cost_index, threshold=max(55, threshold - 25))
+            if score > best[1]:
+                best = (src, score, mtype, cand)
+        src, score, mtype, used_cand = best
+        min_score = min(min_score, score)
+        if not src:
+            return None
+        unit_cost = cost_map.get(normalize_text(src), 0)
+        if unit_cost <= 0:
+            return None
+        total += unit_cost * qty
+        details.append(f"{src} {unit_cost:,}원×{qty}")
+    return {
+        "unit_cost": int(round(total)),
+        "matched": " + ".join(details),
+        "score": int(min_score),
+        "method": "세트/수량 원가자동계산",
+    }
+
+
+def find_transaction_header_row(raw_df):
+    for i in range(min(len(raw_df), 30)):
+        vals = [str(x).replace("\n", "").strip() for x in raw_df.iloc[i].tolist()]
+        joined = "|".join(vals)
+        if "주문 상품명" in joined and "수량" in joined and "공급가" in joined:
+            return i
+    return None
+
+
+def normalize_transaction_sheet(df, source_file="", sheet_name=""):
+    df = df.copy()
+    df.columns = [str(c).replace("\n", "").strip() for c in df.columns]
+    col_map = {}
+    for c in df.columns:
+        cs = str(c).replace(" ", "")
+        if cs in ["파트너사", "거래처", "정산거래처명"]:
+            col_map[c] = "파트너사"
+        elif cs in ["주문상품명", "상품명"]:
+            col_map[c] = "주문 상품명"
+        elif cs == "수량":
+            col_map[c] = "수량"
+        elif cs == "공급가":
+            col_map[c] = "공급가"
+        elif cs == "상품금액":
+            col_map[c] = "상품금액"
+        elif cs == "배송비":
+            col_map[c] = "배송비"
+        elif cs == "총액":
+            col_map[c] = "총액"
+        elif cs == "송장번호":
+            col_map[c] = "송장번호"
+        elif cs == "주문일":
+            col_map[c] = "주문일"
+        elif cs == "수취인":
+            col_map[c] = "수취인"
+        elif cs in ["수취인주소", "주소"]:
+            col_map[c] = "수취인 주소"
+    df = df.rename(columns=col_map)
+    required = ["파트너사", "주문 상품명", "수량", "공급가"]
+    if not set(required).issubset(set(df.columns)):
+        return pd.DataFrame(columns=OUTPUT_COLS + ["원천파일", "원천시트"])
+    for c in OUTPUT_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    out = df[OUTPUT_COLS].copy()
+    out["파트너사"] = out["파트너사"].map(normalize_text)
+    out["주문 상품명"] = out["주문 상품명"].map(normalize_text)
+    out["수량"] = out["수량"].map(clean_qty)
+    out["공급가"] = out["공급가"].map(clean_price)
+    out["상품금액"] = out["상품금액"].map(clean_price)
+    out["배송비"] = out["배송비"].map(clean_price)
+    out["총액"] = out["총액"].map(clean_price)
+    out = out[out["주문 상품명"].ne("")]
+    out = out[~out["주문 상품명"].str.contains(r"^합계$|^총합계$", regex=True, na=False)]
+    out = out[out["수량"].gt(0)]
+    out["원천파일"] = source_file
+    out["원천시트"] = sheet_name
+    return out
+
+
+def read_transaction_excel_bytes(data, source_file=""):
+    frames = []
+    bio = io.BytesIO(data)
+    xl = pd.ExcelFile(bio)
+    for sheet in xl.sheet_names:
+        # 일반 헤더 우선
+        try:
+            bio1 = io.BytesIO(data)
+            df = pd.read_excel(bio1, sheet_name=sheet)
+            norm = normalize_transaction_sheet(df, source_file, sheet)
+            if not norm.empty:
+                frames.append(norm)
+                continue
+        except Exception:
+            pass
+        # 중간 헤더 탐색
+        try:
+            bio2 = io.BytesIO(data)
+            raw = pd.read_excel(bio2, sheet_name=sheet, header=None)
+            header_row = find_transaction_header_row(raw)
+            if header_row is not None:
+                header = raw.iloc[header_row].astype(str).str.replace("\n", "", regex=False).str.strip().tolist()
+                df2 = raw.iloc[header_row + 1 :].copy()
+                df2.columns = header
+                norm = normalize_transaction_sheet(df2, source_file, sheet)
+                if not norm.empty:
+                    frames.append(norm)
+        except Exception:
+            pass
+    if frames:
+        return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(columns=OUTPUT_COLS + ["원천파일", "원천시트"])
+
+
+def read_transaction_zip(uploaded_zip):
+    zbytes = uploaded_zip.getvalue() if hasattr(uploaded_zip, "getvalue") else uploaded_zip.read()
+    rows = []
+    skipped = []
+    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
+        for name in zf.namelist():
+            base = os.path.basename(name)
+            if not base or base.startswith(".") or base.startswith("~$") or name.startswith("__MACOSX"):
+                continue
+            if not base.lower().endswith((".xlsx", ".xls")):
+                continue
+            # 요약/오류 파일은 실제 업체 거래내역이 아니므로 기본 제외
+            if base.startswith("00_") or base.startswith("99_"):
+                continue
+            try:
+                data = zf.read(name)
+                df = read_transaction_excel_bytes(data, base)
+                if df.empty:
+                    skipped.append(base)
+                else:
+                    rows.append(df)
+            except Exception as e:
+                skipped.append(f"{base} ({e})")
+    if not rows:
+        return pd.DataFrame(columns=OUTPUT_COLS + ["원천파일", "원천시트"]), skipped
+    return pd.concat(rows, ignore_index=True), skipped
+
+
+def match_cost_by_supply_price(order_name, supply_price, prod_df, cost_index, cost_map, threshold=DEFAULT_MATCH_THRESHOLD):
+    price = clean_price(supply_price)
+    if price <= 0 or prod_df.empty:
+        return "", 0, "", 0
+    prod = prod_df.copy()
+    prod["supply_price"] = prod["supply_price"].map(clean_price)
+    cand = prod[prod["supply_price"].eq(price)].copy()
+    if cand.empty:
+        return "", 0, "", 0
+    if len(cand) == 1:
+        prod_src = normalize_text(cand.iloc[0]["source_product_name"])
+        src, score, mtype = match_one_product_name(prod_src, cost_index, threshold=max(55, threshold - 25))
+        if src and cost_map.get(normalize_text(src), 0) > 0:
+            return src, 100, "공급가보조매칭", cost_map[normalize_text(src)]
+    cand_index = prepare_product_match_index(cand)
+    prod_src, score, mtype = match_one_product_name(order_name, cand_index, threshold=max(55, threshold - 25))
+    if prod_src:
+        src, cscore, cmtype = match_one_product_name(prod_src, cost_index, threshold=max(55, threshold - 25))
+        if src and cost_map.get(normalize_text(src), 0) > 0:
+            return src, min(100, max(score, cscore)), "공급가+상품명보조매칭", cost_map[normalize_text(src)]
+    return "", 0, "", 0
+
+
+def unit_cost_for_transaction(order_name, supply_price, cost_df, prod_df, threshold=DEFAULT_MATCH_THRESHOLD):
+    order_name = normalize_text(order_name)
+    cost_index = prepare_product_match_index(cost_df.rename(columns={"cost_price": "supply_price"})) if not cost_df.empty else prepare_product_match_index(pd.DataFrame(columns=PRODUCT_COLS))
+    prod_index = prepare_product_match_index(prod_df) if not prod_df.empty else cost_index
+    cost_map = {normalize_text(r["source_product_name"]): clean_price(r["cost_price"]) for _, r in cost_df.iterrows()}
+
+    # 세트/수량형 상품명 우선 계산
+    bundle = calculate_bundle_cost(order_name, cost_df, threshold=threshold)
+    if bundle and bundle["unit_cost"] > 0:
+        return bundle["unit_cost"], bundle["matched"], bundle["score"], bundle["method"], ""
+
+    # 원가마스터 직접 매칭
+    src, score, mtype = match_one_product_name(order_name, cost_index, threshold=threshold)
+    unit_cost = cost_map.get(normalize_text(src), 0) if src else 0
+    if src and unit_cost > 0:
+        return unit_cost, src, score, mtype, ""
+
+    # 상품마스터명으로 매칭 후 원가마스터 재매칭
+    prod_src, pscore, pmtype = match_one_product_name(order_name, prod_index, threshold=threshold)
+    if prod_src:
+        csrc, cscore, cmtype = match_one_product_name(prod_src, cost_index, threshold=max(55, threshold - 25))
+        unit_cost = cost_map.get(normalize_text(csrc), 0) if csrc else 0
+        if csrc and unit_cost > 0:
+            return unit_cost, csrc, min(100, max(pscore, cscore)), "상품마스터경유매칭", ""
+
+    # 공급가 보조매칭: 상품명으로 실패한 경우에만 사용. 네고단가는 상품명 매칭이 우선입니다.
+    csrc, cscore, cmtype, unit_cost = match_cost_by_supply_price(order_name, supply_price, prod_df, cost_index, cost_map, threshold=threshold)
+    if csrc and unit_cost > 0:
+        return unit_cost, csrc, cscore, cmtype, ""
+
+    err = "원가상품 미매칭; " if not src and not prod_src else "원가 누락/0원; "
+    return 0, src or prod_src or "", score or pscore or 0, mtype or pmtype or "미매칭", err
+
+
+def calculate_cost_from_transaction_files(tx_df, match_threshold=DEFAULT_MATCH_THRESHOLD, partner_threshold=DEFAULT_PARTNER_MATCH_THRESHOLD):
+    """업체별 거래내역서 ZIP을 기준으로 원가를 계산합니다. 배송비는 무시합니다."""
+    prod = read_table("product_master", PRODUCT_COLS)
+    partners = read_table("partner_master", PARTNER_COLS)
+    cost = read_table("cost_master", COST_COLS)
+
+    df = tx_df.copy()
+    for col in ["파트너사", "주문 상품명", "수취인", "수취인 주소"]:
+        if col in df.columns:
+            df[col] = df[col].map(normalize_text)
+    df["수량"] = df["수량"].map(clean_qty)
+    df["공급가"] = df["공급가"].map(clean_price)
+    df = df[df["주문 상품명"].ne("") & df["수량"].gt(0)].copy()
+
+    partner_match_df = build_partner_matches(df["파트너사"].dropna().unique(), partners, threshold=partner_threshold)
+    partner_map = {normalize_text(r["원본파트너사"]): normalize_text(r["정산거래처명"]) for _, r in partner_match_df.iterrows()}
+
+    rows = []
+    for _, r in df.iterrows():
+        raw_partner = normalize_text(r.get("파트너사", ""))
+        display_partner = partner_map.get(raw_partner, raw_partner)
+        qty = clean_qty(r.get("수량", 0))
+        order_name = normalize_text(r.get("주문 상품명", ""))
+        unit_cost, matched, score, method, err = unit_cost_for_transaction(order_name, r.get("공급가", 0), cost, prod, threshold=match_threshold)
+        amount = int(round(qty * unit_cost))
+        rows.append({
+            "원본 파트너사": raw_partner,
+            "정산거래처명": display_partner,
+            "주문일": normalize_text(r.get("주문일", "")),
+            "송장번호": normalize_text(r.get("송장번호", "")),
+            "수취인": normalize_text(r.get("수취인", "")),
+            "주문 상품명": order_name,
+            "수량": qty,
+            "공급가": clean_price(r.get("공급가", 0)),
+            "상품금액": clean_price(r.get("상품금액", 0)),
+            "매칭 원가상품명": matched,
+            "매칭점수": int(round(score)) if score else 0,
+            "매칭방식": method,
+            "실제 출고상품명": order_name,
+            "단품원가": int(unit_cost),
+            "원가금액": amount,
+            "오류": err,
+            "원천파일": normalize_text(r.get("원천파일", "")),
+            "원천시트": normalize_text(r.get("원천시트", "")),
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["정산거래처명", "주문 상품명", "수량", "단품원가", "원가금액", "오류"])
+    out["수량"] = out["수량"].map(lambda x: int(x) if float(x).is_integer() else round(float(x), 2))
+    return out
+
+
+def apply_manual_cost_edits(cost_df):
+    out = cost_df.copy()
+    out["수량"] = out["수량"].map(clean_qty)
+    out["단품원가"] = out["단품원가"].map(clean_price)
+    out["원가금액"] = (out["수량"] * out["단품원가"]).round().astype(int)
+    out["오류"] = out.apply(lambda r: "" if clean_price(r.get("단품원가", 0)) > 0 else normalize_text(r.get("오류", "")) or "원가 누락/0원; ", axis=1)
     return out
 
 
@@ -1249,41 +1682,104 @@ def page_cost_master():
 
 def page_cost_settlement():
     st.subheader("거래처별 원가정산")
-    st.markdown("정산 완료 후 ERP 원가 입력용으로 쓰는 기능입니다. RAW 출고리스트를 업로드하면 실제 출고된 단품 기준으로 거래처별 원가를 계산합니다. 배송비는 포함하지 않습니다.")
+    st.markdown(
+        "정산이 끝난 뒤 업체별 거래내역서 엑셀들을 ZIP으로 묶어 업로드하면, "
+        "거래처별 제품 원가를 계산합니다. 배송비는 원가에 포함하지 않습니다."
+    )
     with st.expander("매칭 설정", expanded=True):
         match_threshold = st.slider("원가상품 유사매칭 기준점수", min_value=70, max_value=100, value=DEFAULT_MATCH_THRESHOLD, step=1, key="cost_match_threshold")
         partner_threshold = st.slider("파트너사 오타 자동묶음 기준점수", min_value=60, max_value=100, value=DEFAULT_PARTNER_MATCH_THRESHOLD, step=1, key="cost_partner_threshold")
-    raw_upload = st.file_uploader("RAW 출고리스트 엑셀 업로드", type=["xlsx"], key="cost_raw_upload")
-    if not raw_upload:
-        st.info("정산 때 사용한 것과 같은 RAW 출고리스트를 업로드하면 됩니다. 자사상품명 분해라인을 이용해 실제 출고 단품 기준 원가를 계산합니다.")
+        st.caption("상품명 매칭이 먼저이고, 상품명으로 못 찾는 경우에만 공급가를 보조근거로 사용합니다. 업체별 네고단가는 상품명 기준으로 매칭됩니다.")
+
+    st.info("사용 방법: 업체들에게 보낸 거래내역서 엑셀파일들을 하나의 ZIP으로 압축해서 업로드하세요. 00_요약/99_오류 파일은 자동 제외됩니다.")
+    zip_upload = st.file_uploader("업체별 거래내역서 ZIP 업로드", type=["zip"], key="cost_transaction_zip_upload")
+    if not zip_upload:
         return
+
     try:
-        raw = read_raw_excel(raw_upload)
-        ensure_partners(raw, partner_threshold=partner_threshold)
         ensure_cost_master_from_products()
-        cost_df = explode_cost_components(raw, match_threshold=match_threshold, partner_threshold=partner_threshold)
+        tx_df, skipped = read_transaction_zip(zip_upload)
+        if tx_df.empty:
+            st.error("ZIP 안에서 거래내역서 형식의 엑셀파일을 찾지 못했습니다. 각 엑셀에 파트너사/주문 상품명/수량/공급가 컬럼이 있는지 확인해 주세요.")
+            if skipped:
+                st.caption("건너뛴 파일: " + ", ".join(skipped[:20]))
+            return
+
+        cost_df = calculate_cost_from_transaction_files(tx_df, match_threshold=match_threshold, partner_threshold=partner_threshold)
+        if cost_df.empty:
+            st.error("계산 가능한 거래내역이 없습니다.")
+            return
+
+        st.markdown("### 원가 상세 수정")
+        st.caption("미매칭/원가 누락 행은 아래 표에서 단품원가를 직접 입력하면 즉시 거래처별 원가요약에 반영됩니다.")
+        edit_cols = [
+            "정산거래처명", "주문 상품명", "수량", "공급가", "상품금액",
+            "매칭 원가상품명", "매칭방식", "매칭점수", "단품원가", "오류", "원천파일"
+        ]
+        for c in edit_cols:
+            if c not in cost_df.columns:
+                cost_df[c] = ""
+        edited = st.data_editor(
+            cost_df[edit_cols],
+            use_container_width=True,
+            height=420,
+            num_rows="fixed",
+            column_config={
+                "단품원가": st.column_config.NumberColumn("단품원가", min_value=0, step=1, format="%d"),
+                "수량": st.column_config.NumberColumn("수량", disabled=True),
+                "공급가": st.column_config.NumberColumn("공급가", disabled=True, format="%d"),
+                "상품금액": st.column_config.NumberColumn("상품금액", disabled=True, format="%d"),
+            },
+            disabled=[c for c in edit_cols if c != "단품원가"],
+            key="cost_tx_editor",
+        )
+        # 편집된 단품원가를 원본 상세에 반영
+        final_df = cost_df.copy()
+        final_df["단품원가"] = edited["단품원가"].values
+        final_df = apply_manual_cost_edits(final_df)
+
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("거래처", f"{cost_df['정산거래처명'].nunique():,}개")
-        c2.metric("출고 단품 라인", f"{len(cost_df):,}건")
-        c3.metric("총 출고수량", f"{float(cost_df['수량'].sum()):,.0f}개")
-        c4.metric("총 원가", f"{int(cost_df['원가금액'].sum()):,}원")
-        errors = cost_df[cost_df["오류"].fillna("").ne("")]
+        c1.metric("거래처", f"{final_df['정산거래처명'].nunique():,}개")
+        c2.metric("거래라인", f"{len(final_df):,}건")
+        c3.metric("총 수량", f"{float(final_df['수량'].sum()):,.0f}개")
+        c4.metric("총 제품원가", f"{int(final_df['원가금액'].sum()):,}원")
+
+        errors = final_df[final_df["오류"].fillna("").ne("")]
         if not errors.empty:
-            st.error(f"원가 미매칭/누락 {len(errors):,}건이 있습니다. 원가 관리 메뉴에서 원가를 입력하거나 상품명을 확인하세요.")
-            st.dataframe(errors.head(500), use_container_width=True, height=260)
+            st.warning(f"아직 원가 미매칭/누락 {len(errors):,}건이 있습니다. 위 표에서 단품원가를 입력하면 요약에 반영됩니다.")
         else:
             st.success("원가 누락 없이 계산되었습니다.")
+        if skipped:
+            with st.expander("건너뛴 파일 확인"):
+                st.write(skipped)
+
         st.markdown("### 거래처별 원가요약")
-        partner_summary = cost_df.groupby("정산거래처명", as_index=False).agg(출고단품수량=("수량", "sum"), 원가금액=("원가금액", "sum")).sort_values("원가금액", ascending=False)
-        st.dataframe(partner_summary, use_container_width=True, height=260)
+        partner_summary = final_df.groupby("정산거래처명", as_index=False).agg(
+            거래라인=("주문 상품명", "count"),
+            총수량=("수량", "sum"),
+            제품원가=("원가금액", "sum"),
+            오류건수=("오류", lambda s: int(s.fillna("").ne("").sum())),
+        ).sort_values("제품원가", ascending=False)
+        st.dataframe(partner_summary, use_container_width=True, height=300)
+
         st.markdown("### 거래처/상품별 원가")
-        item_summary = cost_df.groupby(["정산거래처명", "매칭 원가상품명", "실제 출고상품명"], dropna=False, as_index=False).agg(수량=("수량", "sum"), 단품원가=("단품원가", "max"), 원가금액=("원가금액", "sum")).sort_values(["정산거래처명", "원가금액"], ascending=[True, False])
+        item_summary = final_df.groupby(["정산거래처명", "주문 상품명", "매칭 원가상품명"], dropna=False, as_index=False).agg(
+            수량=("수량", "sum"),
+            단품원가=("단품원가", "max"),
+            원가금액=("원가금액", "sum"),
+        ).sort_values(["정산거래처명", "원가금액"], ascending=[True, False])
         st.dataframe(item_summary, use_container_width=True, height=360)
-        st.markdown("### 전체 원가 상세")
-        st.dataframe(cost_df.head(1000), use_container_width=True, height=360)
-        st.download_button("원가정산 엑셀 다운로드", data=cost_summary_excel_bytes(cost_df), file_name=f"B2B_거래처별_원가정산_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+
+        st.download_button(
+            "원가정산 엑셀 다운로드",
+            data=cost_summary_excel_bytes(final_df),
+            file_name=f"B2B_거래처별_원가정산_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
     except Exception as e:
         st.exception(e)
+
 
 def page_backup():
     st.subheader("설정 백업/복원")
