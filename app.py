@@ -627,6 +627,43 @@ def apply_data_migrations():
                    AND (source_product_name LIKE '%세정티슈%' OR standard_product_name LIKE '%세정티슈%')
                 """
             )
+
+            # 2026-10 신규 터블 제품 공급가 추가/보정
+            # 기존 DB가 이미 생성된 상태에서도 배포 후 자동으로 상품마스터에 들어가게 합니다.
+            new_products = [
+                ('터블 트루클린 스팟 얼룩제거제 30ml', '터블 트루클린 스팟 얼룩제거제 30ml', '터블', 3000, 0, 3000, '신규제품 공급가 VAT포함'),
+                ('터블 트루클린 스팟 얼룩제거제 30ml (유성용)', '터블 트루클린 스팟 얼룩제거제 30ml (유성용)', '터블', 3000, 0, 3000, '신규제품 공급가 VAT포함 / 스팟 얼룩제거제 옵션'),
+                ('터블 트루클린 스팟 얼룩제거제 30ml (탄닌용)', '터블 트루클린 스팟 얼룩제거제 30ml (탄닌용)', '터블', 3000, 0, 3000, '신규제품 공급가 VAT포함 / 스팟 얼룩제거제 옵션'),
+                ('터블 트루클린 스팟 얼룩제거제 30ml (산화용)', '터블 트루클린 스팟 얼룩제거제 30ml (산화용)', '터블', 3000, 0, 3000, '신규제품 공급가 VAT포함 / 스팟 얼룩제거제 옵션'),
+                ('터블 트루클린 스팟 얼룩제거제 30ml (음식물용)', '터블 트루클린 스팟 얼룩제거제 30ml (음식물용)', '터블', 3000, 0, 3000, '신규제품 공급가 VAT포함 / 스팟 얼룩제거제 옵션'),
+                ('터블 트루클린 스팟 얼룩제거제 30ml (단백질용)', '터블 트루클린 스팟 얼룩제거제 30ml (단백질용)', '터블', 3000, 0, 3000, '신규제품 공급가 VAT포함 / 스팟 얼룩제거제 옵션'),
+                ('터블 트루클린 캡슐 세탁세제 7종 선물세트', '터블 트루클린 캡슐 세탁세제 7종 선물세트', '터블', 7000, 0, 3000, '신규제품 공급가 VAT포함'),
+                ('터블 트루클린 캡슐 세탁세제 100P (그라스)', '터블 트루클린 캡슐 세탁세제 100P (그라스)', '터블', 7000, 0, 3000, '신규제품 공급가 VAT포함'),
+                ('터블 파워클린 버블 변기클리너 (4개입)', '터블 파워클린 버블 변기클리너 (4개입)', '터블', 5600, 0, 3000, '신규제품 공급가 VAT포함'),
+            ]
+            for src, std, brand, price, carton, ship, memo in new_products:
+                existing = c.execute(
+                    "SELECT supply_price FROM product_master WHERE source_product_name = ?",
+                    (src,),
+                ).fetchone()
+                if existing is None:
+                    c.execute(
+                        """
+                        INSERT INTO product_master
+                            (source_product_name, standard_product_name, brand, supply_price, carton_qty, shipping_fee, memo)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (src, std, brand, int(price), int(carton), int(ship), memo),
+                    )
+                elif clean_price(existing[0]) in (0, int(price)):
+                    c.execute(
+                        """
+                        UPDATE product_master
+                           SET standard_product_name = ?, brand = ?, supply_price = ?, carton_qty = ?, shipping_fee = ?, memo = ?
+                         WHERE source_product_name = ?
+                        """,
+                        (std, brand, int(price), int(carton), int(ship), memo, src),
+                    )
             c.commit()
     except Exception:
         pass
